@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Public read for live chat; writes only via Admin SDK (API routes).
+    match /cohortCommsMessages/{messageId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}
