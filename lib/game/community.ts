@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -26,8 +27,11 @@ import { getAdminDb } from "@/lib/firebase-admin";
 import type {
   AttackOutcome,
   Caste,
+  ChatScope,
   CommunityEvent,
   CommunityMessage,
+  HeroClass,
+  HeroSpecialty,
 } from "./types";
 
 function adminDbOrThrow(): Firestore {
@@ -80,12 +84,102 @@ interface MilestoneEvent extends BaseEventInput {
   kind: "milestone_1k_tiles";
 }
 
+interface SealBrokenEvent extends BaseEventInput {
+  kind: "seal_broken";
+  sealIndex: number;       // 0..6
+  seasonNumber: number;
+}
+
+interface ArmageddonStartedEvent extends BaseEventInput {
+  kind: "armageddon_started";
+  seasonNumber: number;
+}
+
+interface ArmageddonCompletedEvent extends BaseEventInput {
+  kind: "armageddon_completed";
+  seasonNumber: number;
+}
+
+interface ArmageddonWinnerEvent extends BaseEventInput {
+  kind: "armageddon_winner";
+  seasonNumber: number;
+  winnerRank: number;      // 1..10
+  tilesHeld: number;
+  sealsBroken: number;
+  tickets: number;
+}
+
+interface ArmageddonCastFailedEvent extends BaseEventInput {
+  kind: "armageddon_cast_failed";
+  seasonNumber: number;
+}
+
+interface HeroEmergedEvent extends BaseEventInput {
+  kind: "hero_emerged";
+  tileId: string;
+  heroId: string;
+  heroName: string;
+  heroClass: HeroClass;
+  heroSpecialty: HeroSpecialty;
+}
+
+interface HeroDefectedEvent extends BaseEventInput {
+  kind: "hero_defected";
+  tileId: string;
+  heroId: string;
+  heroName: string;
+  heroClass: HeroClass;
+  heroSpecialty: HeroSpecialty;
+  // Original owner whose hero defected to the actor.
+  otherUserId: string;
+  otherDisplayName: string;
+  otherCaste: Caste | null;
+}
+
+interface HeroSlainEvent extends BaseEventInput {
+  kind: "hero_slain";
+  tileId: string;
+  heroId: string;
+  heroName: string;
+  heroClass: HeroClass;
+  heroSpecialty: HeroSpecialty;
+  // Attacker who chose the kill outcome.
+  otherUserId: string;
+  otherDisplayName: string;
+  otherCaste: Caste | null;
+}
+
+interface PactBrokenEvent extends BaseEventInput {
+  kind: "pact_broken";
+  targetUserId: string;
+  targetDisplayName: string;
+  pactId: string;
+  pactStatement: string;
+}
+
+interface ProphecyFulfilledEvent extends BaseEventInput {
+  kind: "prophecy_fulfilled";
+  prophecyId: string;
+  prophecyPrediction: string;
+  prophecyTargetSealNumber: number;
+}
+
 export type CommunityEventInput =
   | PlayerJoinEvent
   | CastePickEvent
   | CasteChangeEvent
   | AttackEvent
-  | MilestoneEvent;
+  | MilestoneEvent
+  | SealBrokenEvent
+  | ArmageddonStartedEvent
+  | ArmageddonCompletedEvent
+  | ArmageddonWinnerEvent
+  | ArmageddonCastFailedEvent
+  | HeroEmergedEvent
+  | HeroDefectedEvent
+  | HeroSlainEvent
+  | PactBrokenEvent
+  | ProphecyFulfilledEvent;
 
 /**
  * Writes one community-event doc inside an existing transaction.
@@ -127,6 +221,54 @@ export function logCommunityEventInTx(
     };
   } else if (input.kind === "caste_change") {
     extra = { fromCaste: input.fromCaste, toCaste: input.toCaste };
+  } else if (input.kind === "seal_broken") {
+    extra = { sealIndex: input.sealIndex, seasonNumber: input.seasonNumber };
+  } else if (
+    input.kind === "armageddon_started" ||
+    input.kind === "armageddon_completed" ||
+    input.kind === "armageddon_cast_failed"
+  ) {
+    extra = { seasonNumber: input.seasonNumber };
+  } else if (input.kind === "armageddon_winner") {
+    extra = {
+      seasonNumber: input.seasonNumber,
+      winnerRank: input.winnerRank,
+      tilesHeld: input.tilesHeld,
+      sealsBroken: input.sealsBroken,
+      tickets: input.tickets,
+    };
+  } else if (input.kind === "hero_emerged") {
+    extra = {
+      tileId: input.tileId,
+      heroId: input.heroId,
+      heroName: input.heroName,
+      heroClass: input.heroClass,
+      heroSpecialty: input.heroSpecialty,
+    };
+  } else if (input.kind === "hero_defected" || input.kind === "hero_slain") {
+    extra = {
+      tileId: input.tileId,
+      heroId: input.heroId,
+      heroName: input.heroName,
+      heroClass: input.heroClass,
+      heroSpecialty: input.heroSpecialty,
+      otherUserId: input.otherUserId,
+      otherDisplayName: input.otherDisplayName,
+      otherCaste: input.otherCaste,
+    };
+  } else if (input.kind === "pact_broken") {
+    extra = {
+      targetUserId: input.targetUserId,
+      targetDisplayName: input.targetDisplayName,
+      pactId: input.pactId,
+      pactStatement: input.pactStatement,
+    };
+  } else if (input.kind === "prophecy_fulfilled") {
+    extra = {
+      prophecyId: input.prophecyId,
+      prophecyPrediction: input.prophecyPrediction,
+      prophecyTargetSealNumber: input.prophecyTargetSealNumber,
+    };
   }
   tx.set(ref, { ...base, ...extra });
 }
@@ -158,6 +300,54 @@ export async function logCommunityEvent(
     };
   } else if (input.kind === "caste_change") {
     extra = { fromCaste: input.fromCaste, toCaste: input.toCaste };
+  } else if (input.kind === "seal_broken") {
+    extra = { sealIndex: input.sealIndex, seasonNumber: input.seasonNumber };
+  } else if (
+    input.kind === "armageddon_started" ||
+    input.kind === "armageddon_completed" ||
+    input.kind === "armageddon_cast_failed"
+  ) {
+    extra = { seasonNumber: input.seasonNumber };
+  } else if (input.kind === "armageddon_winner") {
+    extra = {
+      seasonNumber: input.seasonNumber,
+      winnerRank: input.winnerRank,
+      tilesHeld: input.tilesHeld,
+      sealsBroken: input.sealsBroken,
+      tickets: input.tickets,
+    };
+  } else if (input.kind === "hero_emerged") {
+    extra = {
+      tileId: input.tileId,
+      heroId: input.heroId,
+      heroName: input.heroName,
+      heroClass: input.heroClass,
+      heroSpecialty: input.heroSpecialty,
+    };
+  } else if (input.kind === "hero_defected" || input.kind === "hero_slain") {
+    extra = {
+      tileId: input.tileId,
+      heroId: input.heroId,
+      heroName: input.heroName,
+      heroClass: input.heroClass,
+      heroSpecialty: input.heroSpecialty,
+      otherUserId: input.otherUserId,
+      otherDisplayName: input.otherDisplayName,
+      otherCaste: input.otherCaste,
+    };
+  } else if (input.kind === "pact_broken") {
+    extra = {
+      targetUserId: input.targetUserId,
+      targetDisplayName: input.targetDisplayName,
+      pactId: input.pactId,
+      pactStatement: input.pactStatement,
+    };
+  } else if (input.kind === "prophecy_fulfilled") {
+    extra = {
+      prophecyId: input.prophecyId,
+      prophecyPrediction: input.prophecyPrediction,
+      prophecyTargetSealNumber: input.prophecyTargetSealNumber,
+    };
   }
   await ref.set({ ...base, ...extra });
 }
@@ -207,22 +397,43 @@ export class CommunityMessageTooLongError extends Error {
   }
 }
 
+export class CommunityMessageWrongCasteError extends Error {
+  constructor() {
+    super(
+      "Cannot post in a caste room you don't belong to. Switch caste rooms or post to global."
+    );
+    this.name = "CommunityMessageWrongCasteError";
+  }
+}
+
 /**
  * Creates a chat message authored by the given user. Validates
  * non-empty body + body length. Caller is responsible for any rate-
  * limiting (use checkUpstashRateLimit before calling this).
+ *
+ * If `scope` is `caste:<x>`, the caller must currently be in caste
+ * `<x>` — enforced server-side so a client can't post into a private
+ * room they aren't a member of.
  */
 export async function createCommunityMessage(args: {
   userId: string;
   displayName: string;
   caste: Caste | null;
   body: string;
+  scope?: ChatScope;
   now?: Date;
 }): Promise<CommunityMessage> {
   const trimmed = args.body.trim();
   if (trimmed.length === 0) throw new CommunityMessageEmptyError();
   if (trimmed.length > MAX_MESSAGE_LENGTH) {
     throw new CommunityMessageTooLongError();
+  }
+  const scope: ChatScope = args.scope ?? "global";
+  if (scope.startsWith("caste:")) {
+    const casteFromScope = scope.slice("caste:".length) as Caste;
+    if (args.caste !== casteFromScope) {
+      throw new CommunityMessageWrongCasteError();
+    }
   }
   const now = args.now ?? new Date();
   const db = adminDbOrThrow();
@@ -234,6 +445,7 @@ export async function createCommunityMessage(args: {
     displayName: args.displayName,
     caste: args.caste,
     body: trimmed,
+    scope,
     createdAt: now,
   };
   await ref.set(message);
@@ -268,17 +480,44 @@ export async function deleteCommunityMessage(args: {
   return { ...data, ...updates };
 }
 
-/** Returns the N most-recent non-deleted chat messages. */
+/** Returns the N most-recent non-deleted chat messages in the given
+ *  scope. Defaults to `global`. Messages without a scope field (legacy
+ *  rows) are treated as global; a global query therefore picks them up
+ *  via a fallback in-memory filter when the query yields too few rows. */
 export async function listRecentCommunityMessages(
-  limit: number = COMMUNITY_PAGE_SIZE
+  limit: number = COMMUNITY_PAGE_SIZE,
+  scope: ChatScope = "global"
 ): Promise<CommunityMessage[]> {
   const db = adminDbOrThrow();
-  // Fetch overhead — we want N visible messages, but some may have been
-  // soft-deleted. Overfetch a bit so the result still has N when there
-  // are recent deletes. Cheap (~0.06¢ per 100 reads).
   const overFetch = Math.max(1, Math.min(300, limit * 2));
+
+  if (scope === "global") {
+    // Until existing rows are backfilled with `scope: 'global'`, the
+    // global room serves all messages that either explicitly target
+    // global or have no scope field. We do this by reading the latest N
+    // messages and filtering in memory (cheap because the collection is
+    // already small and the chat panel only renders 50 at a time).
+    const snap = await db
+      .collection(COMMUNITY_MESSAGES)
+      .orderBy("createdAt", "desc")
+      .limit(overFetch)
+      .get();
+    const out: CommunityMessage[] = [];
+    for (const doc of snap.docs as ReadonlyArray<FirebaseFirestore.QueryDocumentSnapshot>) {
+      const data = doc.data() as CommunityMessage;
+      if (data.deletedAt) continue;
+      const docScope = data.scope ?? "global";
+      if (docScope !== "global") continue;
+      out.push(data);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  // Caste-scoped room: use the composite index (scope ASC, createdAt DESC).
   const snap = await db
     .collection(COMMUNITY_MESSAGES)
+    .where("scope", "==", scope)
     .orderBy("createdAt", "desc")
     .limit(overFetch)
     .get();

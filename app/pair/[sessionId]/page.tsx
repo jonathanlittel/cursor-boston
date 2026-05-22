@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -28,7 +29,7 @@ export default function SessionDetailPage() {
   const sessionId = params.sessionId as string;
   const [session, setSession] = useState<PairSession | null>(null);
   const [otherUser, setOtherUser] = useState<PublicUser | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [notes, setNotes] = useState<SessionNotes>({
     whatWeWorkedOn: "",
     whatILearned: "",
@@ -39,10 +40,8 @@ export default function SessionDetailPage() {
 
   useEffect(() => {
     async function fetchSession() {
-      if (!user || !db || !sessionId) {
-        setLoading(false);
-        return;
-      }
+      if (!user || !db || !sessionId) return;
+      setLoading(true);
 
       try {
         const sessionDoc = await getDoc(doc(db, "pair_sessions", sessionId));

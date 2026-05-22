@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -13,6 +14,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { getClientIdentifier } from "@/lib/rate-limit";
 import { checkUpstashRateLimit } from "@/lib/upstash-rate-limit";
 import { profileContract } from "@/lib/api-schemas/profile";
+import { rebuildPublicMembersSnapshot } from "@/lib/members-public-snapshot";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -82,6 +84,12 @@ export async function PATCH(request: NextRequest) {
     await userRef.update({
       ...visibilityUpdates,
       updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Refresh members snapshot asynchronously to avoid blocking profile saves
+    // on a full directory rebuild.
+    void rebuildPublicMembersSnapshot(db).catch((snapshotError) => {
+      console.warn("[profile/visibility] Failed to refresh members snapshot", snapshotError);
     });
 
     // Get updated profile

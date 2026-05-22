@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -60,6 +61,16 @@ export interface ActionProgress {
   done: number;
   total: number;
   artifactsFound: number;
+}
+
+/** Slim leaderboard row used by the SealsPanel contender list. Just enough
+ *  to render rank + name + caste + tile count; full leaderboard lives on
+ *  /game/leaderboard. */
+export interface TopLeaderRow {
+  userId: string;
+  displayName: string;
+  caste: Caste | null;
+  tilesHeld: number;
 }
 
 /** Output of `recommendNext()` — the "what should I do" callout. */

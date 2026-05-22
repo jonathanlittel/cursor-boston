@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -23,9 +24,9 @@ import { LandsCard } from "./LandsCard";
 import { ArmyCard } from "./ArmyCard";
 import { ThreatCard } from "./ThreatCard";
 import { ShieldCard } from "./ShieldCard";
+import { SealsPanel } from "./SealsPanel";
 import { ExploreFrontier } from "./ExploreFrontier";
 import { FarExpedition } from "./FarExpedition";
-import { SpyAction } from "./SpyAction";
 import { BulkDistribute } from "./BulkDistribute";
 import { BulkUnassign } from "./BulkUnassign";
 import { MiniMap } from "./MiniMap";
@@ -34,6 +35,8 @@ import { DashboardReports } from "./DashboardReports";
 import { CasteChangeCard } from "./CasteChangeCard";
 import { CommunityPanel } from "./CommunityPanel";
 import { DesignersWantedCard } from "./DesignersWantedCard";
+import { HeroesRosterCard } from "./HeroesRosterCard";
+import { SummonableUnitsCard } from "./SummonableUnitsCard";
 import { OnboardingWizard } from "../onboarding/OnboardingWizard";
 import type { GamePlayer } from "@/lib/game/types";
 
@@ -75,7 +78,6 @@ export function DashboardView({ player, data }: DashboardViewProps) {
     handleSetName,
     handleAdminGrant,
     handleFarExpedition,
-    handleCastIntelSpell,
     recentReports,
   } = data;
 
@@ -175,12 +177,47 @@ export function DashboardView({ player, data }: DashboardViewProps) {
 
         <RecommendedAction rec={recommended} phase={player.phase} />
 
-        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <SealsPanel
+          worldMeta={data.worldMeta}
+          topLeaders={data.topLeaders}
+          playerTilesHeld={player.stats.tilesHeld}
+          playerTiles={tiles}
+        />
+
+        <div className="mb-8">
+          <NavGrid phase={player.phase} />
+        </div>
+
+        <CommunityPanel
+          user={data.user}
+          isAdmin={isAdmin}
+          myCaste={player.caste}
+        />
+
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-6 mb-6">
           <LandsCard counts={counts} />
           <ArmyCard army={army} cap={unitCap} />
           <ThreatCard threats={threats} shielded={shieldStatus.shielded} />
           <ShieldCard shield={shieldStatus} />
         </div>
+
+        <HeroesRosterCard tiles={tiles} />
+        <SummonableUnitsCard player={player} onRefresh={data.refresh} />
+
+        {isAdmin && (
+          <div className="mb-8 pt-4 border-t border-dashed border-neutral-300 dark:border-neutral-700">
+            <p className="text-[11px] uppercase tracking-wide text-neutral-500 mb-2">
+              Admin
+            </p>
+            <button
+              onClick={handleAdminGrant}
+              className="px-4 py-2 border border-amber-400 text-amber-700 dark:text-amber-300 rounded-lg hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors text-sm"
+              title="Manual override. The Sunday cron is the primary mechanism."
+            >
+              Grant 100 turns (admin)
+            </button>
+          </div>
+        )}
 
         <div className="grid md:grid-cols-3 gap-6 mb-8">
           <div className="md:col-span-2 space-y-4">
@@ -199,15 +236,6 @@ export function DashboardView({ player, data }: DashboardViewProps) {
               <FarExpedition
                 turnsRemaining={player.turnsRemaining}
                 onLaunch={handleFarExpedition}
-              />
-            )}
-
-            {player.phase === "play" && player.caste && (
-              <SpyAction
-                caste={player.caste}
-                tilesHeld={player.stats.tilesHeld}
-                turnsRemaining={player.turnsRemaining}
-                onCast={handleCastIntelSpell}
               />
             )}
 
@@ -262,26 +290,7 @@ export function DashboardView({ player, data }: DashboardViewProps) {
           </div>
         </div>
 
-        <NavGrid phase={player.phase} />
-
-        {isAdmin && (
-          <div className="mt-4 pt-4 border-t border-dashed border-neutral-300 dark:border-neutral-700">
-            <p className="text-[11px] uppercase tracking-wide text-neutral-500 mb-2">
-              Admin
-            </p>
-            <button
-              onClick={handleAdminGrant}
-              className="px-4 py-2 border border-amber-400 text-amber-700 dark:text-amber-300 rounded-lg hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors text-sm"
-              title="Manual override. The Sunday cron is the primary mechanism."
-            >
-              Grant 100 turns (admin)
-            </button>
-          </div>
-        )}
-
         <DashboardReports reports={recentReports} />
-
-        <CommunityPanel user={data.user} isAdmin={isAdmin} />
       </div>
     </div>
   );

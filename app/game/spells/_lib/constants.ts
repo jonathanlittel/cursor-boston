@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -32,6 +33,7 @@ export const TYPE_LABEL: Record<SpellType, string> = {
   siege: "Siege",
   disarm: "Disarm",
   attrition: "Attrition",
+  armageddon: "Armageddon",
 };
 
 export const RARITY_TEXT: Record<string, string> = {

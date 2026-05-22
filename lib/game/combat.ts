@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -938,6 +939,22 @@ export function resolveAttack(
     attackPower *= 1 + attacker.intelOffenseBonus;
   }
 
+  // Hero attack bonus (May 2026 Heroes feature). Pre-resolved by the
+  // server: stamina-scaled, specialty-weighted, and includes any stationed
+  // special-unit attackBonus contribution rolled into the same channel.
+  // Stacks multiplicatively at the same stage as `intelOffenseBonus`.
+  if (attacker.heroAttackBonus && attacker.heroAttackBonus > 0) {
+    attackPower *= 1 + attacker.heroAttackBonus;
+  }
+
+  // Oathbreaker penalty (zero-turn gameplay: enforced pacts). Applied
+  // multiplicatively as a reduction. Pre-resolved by the server: a value
+  // > 0 means the attacker has an active oathbreaker mark from breaking
+  // a pact within the OATHBREAKER_DURATION_MS window.
+  if (attacker.oathbreakerPenalty && attacker.oathbreakerPenalty > 0) {
+    attackPower *= 1 - Math.min(1, attacker.oathbreakerPenalty);
+  }
+
   // Source-tile attack multiplier (military ×1.20, food ×0.75). Applied
   // after spell + intel offense bonuses so the multiplier scales the full
   // realized attack value the way a player would expect ("my army is
@@ -985,6 +1002,23 @@ export function resolveAttack(
   // Alert-vs-caster intel effects (Black Vein of Truth, Green Root Whisper).
   if (defender.intelDefenseBonus && defender.intelDefenseBonus > 0) {
     defensePower *= 1 + defender.intelDefenseBonus;
+  }
+
+  // Hero defense bonus (May 2026 Heroes feature). Same stage as
+  // `intelDefenseBonus`; pre-resolved by the server with stamina + specialty
+  // weighting and stationed special-unit defenseBonus folded in.
+  if (defender.heroDefenseBonus && defender.heroDefenseBonus > 0) {
+    defensePower *= 1 + defender.heroDefenseBonus;
+  }
+
+  // Zero-turn defense bonus (defensive stance + last stand, minus any
+  // adjacent-rally penalty). Pre-resolved by the server. A positive value
+  // is a bonus; a negative value (e.g. rally pulling reserves) is a
+  // penalty. Applied multiplicatively at the same stage as the hero
+  // defense bonus.
+  if (defender.zeroTurnDefenseBonus && defender.zeroTurnDefenseBonus !== 0) {
+    const multiplier = Math.max(0, 1 + defender.zeroTurnDefenseBonus);
+    defensePower *= multiplier;
   }
 
   let underdogApplied = false;

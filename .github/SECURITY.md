@@ -68,7 +68,7 @@ If you're deploying Cursor Boston:
    - Test rules thoroughly before production
    - Review rules regularly for security gaps
 3. **Authentication** - Use strong authentication methods
-   - Enable 2FA for admin accounts
+   - Maintainers and committers MUST use **phishing-resistant 2FA** (hardware security keys / FIDO2 / WebAuthn / passkeys). TOTP-only (Authy, Google Authenticator) and SMS are not sufficient for maintainer accounts. The `rogerSuperBuilderAlpha` GitHub organization enforces org-level 2FA — see [`MAINTAINERS.md` § Maintainer account security](../MAINTAINERS.md#maintainer-account-security).
    - Use OAuth providers with proper redirect URIs
    - Regularly review authorized domains in Firebase
 4. **HTTPS** - Always use HTTPS in production
@@ -90,6 +90,12 @@ If you're deploying Cursor Boston:
    - Sanitize user inputs to prevent XSS
    - Validate file uploads (type, size)
    - Use parameterized queries (Firestore handles this)
+
+## Release integrity
+
+- **Signed releases** — every release after v0.2.2 ships Sigstore-signed SBOMs (`sbom.json.cosign.bundle`, `sbom.spdx.json.cosign.bundle`) and a SLSA L2 build provenance attestation. Verify with [cosign](https://github.com/sigstore/cosign).
+- **Signed tags** — release tags from v0.3.0 forward are signed with gitsign or GPG. The release workflow refuses to publish unsigned tags. See [`docs/RELEASING.md` § Signed tags](../docs/RELEASING.md#signed-tags) for verification commands.
+- **Branch protection** — `main` and `develop` require PR + review + status checks; `main` additionally enforces `enforce_admins`.
 
 ## Preventing Accidental Secret Exposure
 

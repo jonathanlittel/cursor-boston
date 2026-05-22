@@ -74,7 +74,9 @@ Choose the approach that fits your workflow:
 
 6. **Web app config**: **Project settings → General → Your apps →** register a **Web** app. Copy **apiKey**, **authDomain**, **projectId**, **storageBucket**, **messagingSenderId**, **appId**, and the Realtime Database URL into **`.env.local`**, using [`.env.local.example`](../.env.local.example) as the template.
 
-7. **Optional but common for API routes and scripts:** add **`FIREBASE_SERVICE_ACCOUNT_JSON`** as described in [Formatting `FIREBASE_SERVICE_ACCOUNT_JSON`](#formatting-firebase_service_account_json).
+7. **Link-token signing secret:** set **`UNSUBSCRIBE_SECRET`** to a unique value of at least 32 bytes. Generate one with `openssl rand -hex 32`. This signs unsubscribe, cohort-withdraw, and PyData-withdraw links; production builds fail closed if it is missing or weak.
+
+8. **Optional but common for API routes and scripts:** add **`FIREBASE_SERVICE_ACCOUNT_JSON`** as described in [Formatting `FIREBASE_SERVICE_ACCOUNT_JSON`](#formatting-firebase_service_account_json).
 
 Restart **`npm run dev`** after editing `.env.local` so Next.js reloads env vars.
 
@@ -117,6 +119,14 @@ cat path/to/serviceAccount.json | jq -c . | pbcopy
 | `npm run test:coverage` | Jest with coverage report (text + lcov) | Check coverage metrics |
 | `npm run test:rules` | Firestore security rules tests | When editing `config/firebase/firestore.rules` (requires Firebase emulator) |
 | `npm run validate-env` | Validate required environment variables | Debugging build failures |
+
+#### Emergency build escape hatch — `SKIP_TYPECHECK=1`
+
+`next.config.js` honors `SKIP_TYPECHECK=1` to disable both the TypeScript and ESLint build checks for one invocation. Use it only when pre-existing in-flight branch state has typecheck/lint errors in unrelated files and you need a local production build for visual QA. **Never set this in CI** — CI is the boundary that catches type errors; bypassing it locally is fine because you're the boundary.
+
+```bash
+SKIP_TYPECHECK=1 npm run build && npm start
+```
 
 ### Admin/Ops Scripts
 

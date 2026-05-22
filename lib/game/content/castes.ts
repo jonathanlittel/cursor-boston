@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -36,6 +37,9 @@ export const CASTE_PROFILES: Record<Caste, CasteProfile> = {
       siege: 0.85,
       disarm: 1.30,
       attrition: 0.85,
+      // Armageddon is caste-agnostic — success rolls off magic-tile count,
+      // not caste affinity — so every caste reads 1.0 here.
+      armageddon: 1.0,
     },
     supplyMultiplier: 1.25,
     lore:
@@ -53,6 +57,7 @@ export const CASTE_PROFILES: Record<Caste, CasteProfile> = {
       siege: 0.85,
       disarm: 1.10,
       attrition: 1.05,
+      armageddon: 1.0,
     },
     supplyMultiplier: 0.75,
     lore:
@@ -70,6 +75,7 @@ export const CASTE_PROFILES: Record<Caste, CasteProfile> = {
       siege: 1.00,
       disarm: 0.95,
       attrition: 1.30,
+      armageddon: 1.0,
     },
     supplyMultiplier: 0.5,
     lore:
@@ -87,6 +93,7 @@ export const CASTE_PROFILES: Record<Caste, CasteProfile> = {
       siege: 1.30,
       disarm: 0.85,
       attrition: 1.00,
+      armageddon: 1.0,
     },
     supplyMultiplier: 1.0,
     lore:
@@ -104,6 +111,7 @@ export const CASTE_PROFILES: Record<Caste, CasteProfile> = {
       siege: 1.00,
       disarm: 1.10,
       attrition: 0.85,
+      armageddon: 1.0,
     },
     supplyMultiplier: 1.5,
     lore:

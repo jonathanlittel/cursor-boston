@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -71,6 +72,8 @@ import { WHITE_SIEGE_SPELLS } from "./spells/white/siege";
 import { WHITE_DISARM_SPELLS } from "./spells/white/disarm";
 import { WHITE_ATTRITION_SPELLS } from "./spells/white/attrition";
 
+import { ARMAGEDDON_SPELLS } from "./spells/armageddon";
+
 import { BUILDINGS } from "./buildings";
 import { ALL_UPGRADES } from "./upgrades";
 
@@ -100,6 +103,9 @@ export const ALL_SPELLS: SpellDefinition[] = [
   ...GREEN_DEFENSE_SPELLS, ...GREEN_OFFENSE_SPELLS, ...GREEN_PRODUCTION_SPELLS,
   ...GREEN_INTEL_SPELLS,
   ...GREEN_SIEGE_SPELLS, ...GREEN_DISARM_SPELLS, ...GREEN_ATTRITION_SPELLS,
+  // End-game: caste-agnostic Armageddon spell. Routed through its own
+  // server entrypoint; included here so the spell catalog UI surfaces it.
+  ...ARMAGEDDON_SPELLS,
 ];
 
 export const ALL_BUILDINGS: BuildingDefinition[] = BUILDINGS;

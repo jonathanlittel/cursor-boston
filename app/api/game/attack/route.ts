@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -30,6 +31,9 @@ export async function POST(request: NextRequest) {
       targetTileId: parsed.data.targetTileId,
       units: parsed.data.units,
       offenseSpellId: parsed.data.offenseSpellId ?? null,
+      heroAction: parsed.data.heroAction,
+      heroActionOnConvertFail: parsed.data.heroActionOnConvertFail,
+      dispatch: parsed.data.dispatch,
     });
     return apiSuccess({
       attack: result.attack,

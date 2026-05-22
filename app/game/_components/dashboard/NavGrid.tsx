@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -73,7 +74,11 @@ export function NavGrid({ phase }: NavGridProps) {
                 { href: "/game/spells", label: "Spells" },
                 { href: "/game/upgrades", label: "Upgrades" },
                 { href: "/game/artifacts", label: "Artifacts" },
+                { href: "/game/heroes", label: "My Heroes" },
                 { href: "/game/attacks", label: "Attack log" },
+                { href: "/game/armageddon", label: "Armageddon" },
+                { href: "/game/zero-turn", label: "Between turns" },
+                { href: "/game/orders", label: "Order queue" },
               ]
         }
       />

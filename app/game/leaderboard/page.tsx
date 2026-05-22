@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -211,9 +212,14 @@ export default function LeaderboardPage() {
                     {i + 1}
                   </td>
                   <td className="py-2 pr-2 text-sm">
-                    {r.userId === user.uid
-                      ? `${r.displayName || "You"} (you)`
-                      : r.displayName || "—"}
+                    <Link
+                      href={`/game/players/${r.userId}`}
+                      className="hover:underline"
+                    >
+                      {r.userId === user.uid
+                        ? `${r.displayName || "You"} (you)`
+                        : r.displayName || "—"}
+                    </Link>
                   </td>
                   <td className="py-2 pr-2 capitalize">{r.caste ?? "—"}</td>
                   <td className="py-2 pr-2 text-right">{r.tilesHeld}</td>

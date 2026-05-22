@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -175,6 +176,23 @@ export const summerCohortContract = c.router(
       summary: "Public read of merged submissions on a vote-format week",
       responses: { 200: PassthroughOk, 404: ApiErrorSchema },
       metadata: { errorCodes: ["NOT_FOUND"] as const },
+    },
+    myScoreByWeek: {
+      method: "GET",
+      path: "/api/summer-cohort/my-score/:weekId",
+      pathParams: WeekIdParam,
+      query: z.object({ cohortId: CohortIdEnum.optional() }),
+      summary:
+        "Return only the calling user's own AI-judge score for a vote-format week — other users' scores are never exposed by this endpoint",
+      responses: {
+        200: PassthroughOk,
+        401: ApiErrorSchema,
+        404: ApiErrorSchema,
+        500: ApiErrorSchema,
+      },
+      metadata: {
+        errorCodes: ["UNAUTHORIZED", "NOT_FOUND", "SERVER_ERROR"] as const,
+      },
     },
     votesGet: {
       method: "GET",

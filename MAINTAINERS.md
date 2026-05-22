@@ -38,4 +38,29 @@ Aaron holds the **Community Maintainer** title rather than the standard Maintain
 - [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md) — fork workflow, `develop` / `main`, DCO, submission-branch routing
 - [`docs/RELEASING.md`](docs/RELEASING.md) — tag-driven releases, GitHub Releases, release PRs
 - [`docs/SUBMISSION_BRANCHES.md`](docs/SUBMISSION_BRANCHES.md) — what the persistent contribution branches are and when they're used
-- [`.github/ACTIVE_ISSUES.md`](.github/ACTIVE_ISSUES.md) — current roadmap and where to file new issues
+- [`ROADMAP.md`](ROADMAP.md) — current roadmap and where to file new issues (mirrored at `.github/ACTIVE_ISSUES.md`)
+
+## Maintainer account security
+
+Required for all maintainers and any GitHub account with merge rights on this repository (OpenSSF Best Practices Gold criteria `require_2FA` and `secure_2FA`):
+
+1. **Two-factor authentication is mandatory.** Every maintainer MUST have 2FA enabled on their GitHub account. The `rogerSuperBuilderAlpha` organization enforces this at the org level — accounts without 2FA cannot be members.
+2. **Phishing-resistant 2FA only.** The second factor MUST be either a hardware security key (FIDO2 / WebAuthn — YubiKey, Titan, etc.) or a passkey synced via a platform authenticator (iCloud Keychain, 1Password, Bitwarden, etc.). **TOTP-only (Authy, Google Authenticator) is not sufficient** for maintainer accounts because TOTP codes can be phished. SMS 2FA is explicitly forbidden.
+3. **Recovery codes** stored offline (printed and locked, or in a hardware-backed password manager). Lost-key scenarios are recovered via the maintainer team consensus and the Project Lead, not by SMS reset.
+4. **Local commit signing** is encouraged but not required (DCO sign-off is the enforced minimum).
+
+A maintainer who cannot meet the phishing-resistant 2FA requirement (e.g., no access to a hardware key) should contact the Project Lead. The expectation is that hardware keys or passkeys are obtained within 30 days of joining the maintainer team.
+
+## Emeritus
+
+Maintainers who have stepped down but whose contributions are recognized. None currently.
+
+_When a maintainer steps down (graceful step-down per [GOVERNANCE.md](.github/GOVERNANCE.md), or 6+ months of inactivity at a quarterly review), they're moved here with the date they joined and the date they stepped down. The emeritus role retains community recognition but no merge rights._
+
+## Project Lead succession
+
+Current Project Lead: **Roger Hunt** ([@rogerSuperBuilderAlpha](https://github.com/rogerSuperBuilderAlpha)).
+
+Designated successor: _vacant — to be filled at the 2026-Q3 quarterly review._
+
+The succession process is documented in [`.github/GOVERNANCE.md`](.github/GOVERNANCE.md) § Contributor ladder → Succession plan for the Project Lead role. In short: if the Project Lead becomes unreachable for >30 days without prior notice, the maintainer team takes over by consensus and selects an Acting Project Lead within 14 days.

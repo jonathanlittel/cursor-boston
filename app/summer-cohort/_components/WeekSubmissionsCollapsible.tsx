@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -13,6 +14,8 @@ import {
   CheckCircle2,
   ExternalLink,
   GitPullRequest,
+  Lock,
+  Sparkles,
   ThumbsUp,
   Trophy,
 } from "lucide-react";
@@ -47,6 +50,15 @@ interface VotesResponse {
   authenticated: boolean;
 }
 
+interface MyScoreResponse {
+  weekId: string;
+  githubHandle: string;
+  score: number;
+  rationale: string;
+  model: string | null;
+  scoredAt: string | null;
+}
+
 interface WeekSubmissionsCollapsibleProps {
   week: SummerCohortVoteWeek;
   tabId: string;
@@ -62,8 +74,12 @@ interface WeekSubmissionsCollapsibleProps {
   /** From userProfile.photoURL — used to pre-populate the JSON example. */
   currentUserPhotoUrl: string | null;
   /** Switches the parent CohortTabs to "my-info" so the user can connect
-   *  GitHub. Called from the gating CTA. */
+   *  GitHub. Called from the gating CTA. Unused in observer mode. */
   onSwitchToMyInfo: () => void;
+  /** Observer mode: caller is looking at a cohort they aren't admitted to.
+   *  Hides voting, merge instructions, and the "your submission" status —
+   *  submissions render read-only and expansion is free (no GitHub gate). */
+  observer?: boolean;
 }
 
 const REPO_URL = "https://github.com/rogerSuperBuilderAlpha/cursor-boston";
@@ -123,8 +139,13 @@ export function WeekSubmissionsCollapsible({
   currentUserDisplayName,
   currentUserPhotoUrl,
   onSwitchToMyInfo,
+  observer = false,
 }: WeekSubmissionsCollapsibleProps) {
-  const githubConnected = Boolean(currentUserGithubHandle);
+  // In observer mode, the user isn't a member of this cohort — skip the
+  // github gate, never treat any row as "yours", and hide the merge / vote
+  // affordances even if they have a connected handle.
+  const effectiveHandle = observer ? null : currentUserGithubHandle;
+  const githubConnected = observer || Boolean(currentUserGithubHandle);
   const { user } = useAuth();
   const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<SubmissionsResponse | null>(null);
@@ -133,6 +154,12 @@ export function WeekSubmissionsCollapsible({
   const [myVotes, setMyVotes] = useState<Set<string>>(new Set());
   const [pendingVotes, setPendingVotes] = useState<Set<string>>(new Set());
   const [voteError, setVoteError] = useState<string | null>(null);
+  // Score is tagged with the uid + tab it was fetched for, so a stale score
+  // from a previous signed-in user (or previous week) is filtered out at
+  // render time without needing a synchronous reset inside the fetch effect.
+  const [myScore, setMyScore] = useState<
+    (MyScoreResponse & { fetchedForUid: string; fetchedForTab: string }) | null
+  >(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -194,6 +221,41 @@ export function WeekSubmissionsCollapsible({
         // Silent: votes are a soft enhancement; failure shouldn't block the
         // main submissions UI.
       });
+    return () => {
+      cancelled = true;
+    };
+  }, [tabId, user, cohortId]);
+
+  // Fetch the signed-in user's own AI-judge score for this week. The endpoint
+  // resolves the user's handle server-side from `users/{uid}.github.login` and
+  // returns only that user's score — there is no way to ask for another
+  // person's feedback through this client. Stale results (after sign-out or a
+  // tab switch) are filtered at render time via the uid/tab tag on the score.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    const uidAtFetch = user.uid;
+    (async () => {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch(
+          `/api/summer-cohort/my-score/${encodeURIComponent(
+            tabId
+          )}?cohortId=${encodeURIComponent(cohortId)}`,
+          {
+            cache: "no-store",
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        if (!res.ok) return; // 401 / 404 / 500 → silently no feedback panel
+        const json = (await res.json()) as MyScoreResponse;
+        if (!cancelled) {
+          setMyScore({ ...json, fetchedForUid: uidAtFetch, fetchedForTab: tabId });
+        }
+      } catch {
+        // Silent — feedback panel just won't render.
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -275,8 +337,8 @@ export function WeekSubmissionsCollapsible({
   );
 
   const yourStatus = useMemo(
-    () => statusForUser(data, currentUserGithubHandle),
-    [data, currentUserGithubHandle]
+    () => statusForUser(data, effectiveHandle),
+    [data, effectiveHandle]
   );
 
   const merged = data?.merged ?? null;
@@ -285,10 +347,10 @@ export function WeekSubmissionsCollapsible({
   const dirUrl = data
     ? `${REPO_URL}/tree/${week.submissionBranch}/${data.path}`
     : null;
-  const submissionPath = buildSubmissionPath(week, currentUserGithubHandle);
+  const submissionPath = buildSubmissionPath(week, effectiveHandle);
   const exampleJson = buildExampleJson(
     week,
-    currentUserGithubHandle,
+    effectiveHandle,
     currentUserDisplayName,
     currentUserPhotoUrl
   );
@@ -301,7 +363,7 @@ export function WeekSubmissionsCollapsible({
           strokeWidth={2.25}
           aria-hidden="true"
         />
-        Submissions — the focus of the week
+        {observer ? "Submissions — observing" : "Submissions — the focus of the week"}
       </div>
       <p className="mt-1 text-base font-semibold text-neutral-900 dark:text-neutral-100">
         {merged === null ? (
@@ -319,7 +381,7 @@ export function WeekSubmissionsCollapsible({
           </>
         )}
       </p>
-      {yourStatus.kind === "submitted" ? (
+      {!observer && yourStatus.kind === "submitted" ? (
         <p className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
           <CheckCircle2
             className="h-3 w-3"
@@ -331,7 +393,7 @@ export function WeekSubmissionsCollapsible({
             ? " · trying to win"
             : ""}
         </p>
-      ) : yourStatus.kind === "not-submitted" ? (
+      ) : !observer && yourStatus.kind === "not-submitted" ? (
         <p className="mt-1 text-xs text-neutral-700 dark:text-neutral-300">
           No submission from <strong>@{currentUserGithubHandle}</strong> yet —
           expand for the merge instructions.
@@ -372,7 +434,7 @@ export function WeekSubmissionsCollapsible({
           </button>
         </div>
       )}
-      {!githubConnected ? (
+      {!githubConnected && !observer ? (
         <p className="border-t border-emerald-200 px-5 py-3 text-xs text-emerald-900 dark:border-emerald-900 dark:text-emerald-200">
           Connect your GitHub on the My Info tab so we can match your
           submission to your profile and surface the merge instructions
@@ -385,7 +447,8 @@ export function WeekSubmissionsCollapsible({
           id={`submissions-${tabId}-body`}
           className="border-t border-neutral-200 px-4 py-4 dark:border-neutral-800"
         >
-          {/* Merge instructions — full set, pre-populated with your profile */}
+          {/* Merge instructions — hidden for observers (they don't submit here) */}
+          {!observer ? (
           <div className="rounded-lg border border-neutral-200 bg-white p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-950/40 dark:text-neutral-300">
             <p className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
               How to get on this list
@@ -527,9 +590,10 @@ export function WeekSubmissionsCollapsible({
               The submission with the most votes at the end wins the week.
             </p>
           </div>
+          ) : null}
 
           {/* List */}
-          <div className="mt-4">
+          <div className={observer ? "" : "mt-4"}>
             {error ? (
               <p className="text-sm text-amber-700 dark:text-amber-400">
                 Couldn&apos;t load submissions: {error}.
@@ -553,10 +617,26 @@ export function WeekSubmissionsCollapsible({
                     .trim()
                     .charAt(0)
                     .toUpperCase();
+                  const isMine =
+                    effectiveHandle !== null &&
+                    handleKey === effectiveHandle.toLowerCase();
+                  const myFeedback =
+                    isMine &&
+                    myScore &&
+                    user !== null &&
+                    myScore.fetchedForUid === user.uid &&
+                    myScore.fetchedForTab === tabId &&
+                    myScore.githubHandle.toLowerCase() === handleKey
+                      ? myScore
+                      : null;
                   return (
                     <li
                       key={s.githubHandle}
-                      className="flex flex-wrap items-center gap-3 rounded-lg border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
+                      className={
+                        isMine
+                          ? "flex flex-wrap items-center gap-3 rounded-lg border-2 border-emerald-300 bg-emerald-50/40 px-3 py-2 text-sm dark:border-emerald-800 dark:bg-emerald-950/20"
+                          : "flex flex-wrap items-center gap-3 rounded-lg border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
+                      }
                     >
                       {s.photoUrl ? (
                         // eslint-disable-next-line @next/next/no-img-element -- avatar URLs come from arbitrary OAuth providers (GitHub, Google), not the configured Next image domain list
@@ -634,7 +714,19 @@ export function WeekSubmissionsCollapsible({
                           </a>
                         ) : null}
                         {isCompeting ? (
-                          user ? (
+                          observer ? (
+                            <span
+                              className="inline-flex items-center gap-1 rounded-full border border-neutral-200 px-2.5 py-0.5 text-xs font-semibold text-neutral-600 dark:border-neutral-800 dark:text-neutral-400"
+                              title="Observer view — voting is members-only"
+                            >
+                              <ThumbsUp
+                                className="h-3 w-3"
+                                strokeWidth={2.5}
+                                aria-hidden="true"
+                              />
+                              <span className="tabular-nums">{voteCount}</span>
+                            </span>
+                          ) : user ? (
                             <button
                               type="button"
                               onClick={() => toggleVote(s.githubHandle)}
@@ -673,6 +765,36 @@ export function WeekSubmissionsCollapsible({
                           )
                         ) : null}
                       </div>
+                      {myFeedback ? (
+                        <div className="basis-full">
+                          <div className="mt-2 rounded-md border border-emerald-300 bg-white p-3 dark:border-emerald-800 dark:bg-neutral-950">
+                            <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+                              <Sparkles className="h-3.5 w-3.5" strokeWidth={2.25} aria-hidden="true" />
+                              <span>Your AI judge feedback</span>
+                              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                                <Lock className="h-2.5 w-2.5" strokeWidth={2.5} aria-hidden="true" />
+                                visible only to you
+                              </span>
+                              <span className="ml-auto tabular-nums text-emerald-900 dark:text-emerald-300">
+                                <strong className="text-base">{myFeedback.score}</strong>
+                                <span className="text-emerald-700/80 dark:text-emerald-400/80"> / 10</span>
+                              </span>
+                            </div>
+                            <p className="mt-2 whitespace-pre-line text-sm text-neutral-800 dark:text-neutral-200">
+                              {myFeedback.rationale}
+                            </p>
+                            {myFeedback.model || myFeedback.scoredAt ? (
+                              <p className="mt-2 text-[11px] text-neutral-500">
+                                {myFeedback.model ? `Scored by ${myFeedback.model}` : null}
+                                {myFeedback.model && myFeedback.scoredAt ? " · " : null}
+                                {myFeedback.scoredAt
+                                  ? new Date(myFeedback.scoredAt).toLocaleString()
+                                  : null}
+                              </p>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
                     </li>
                   );
                 })}
@@ -682,7 +804,7 @@ export function WeekSubmissionsCollapsible({
                   Vote couldn&apos;t be saved: {voteError}.
                 </p>
               ) : null}
-              {!user ? (
+              {!user && !observer ? (
                 <p className="mt-2 text-xs text-neutral-500">
                   Sign in to upvote submissions you want to win.
                 </p>

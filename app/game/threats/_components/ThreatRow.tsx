@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -170,7 +171,10 @@ export function ThreatRow(props: ThreatRowProps) {
         s.id,
         realizedSpellMagnitude({
           baseStrength: s.baseStrength,
-          caste: s.caste,
+          // Offense spells are always caste-bound; Armageddon is the only
+          // "neutral"-caste spell and it has type !== "offense" so it never
+          // appears in offenseSpells. Cast narrows the runtime invariant.
+          caste: s.caste as Exclude<typeof s.caste, "neutral">,
           spellType: s.type,
           magicLandCount: myMagicLandCount,
           activeUpgrades: player.activeUpgrades ?? {},

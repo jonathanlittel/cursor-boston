@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -12,6 +13,7 @@ import {
   COMMUNITY_PAGE_SIZE,
   CommunityMessageEmptyError,
   CommunityMessageTooLongError,
+  CommunityMessageWrongCasteError,
   MAX_MESSAGE_LENGTH,
   createCommunityMessage,
   listRecentCommunityMessages,
@@ -19,7 +21,14 @@ import {
 import { getAdminDb } from "@/lib/firebase-admin";
 import { getVerifiedUser } from "@/lib/server-auth";
 import { checkUpstashRateLimit } from "@/lib/upstash-rate-limit";
-import type { GamePlayer } from "@/lib/game/types";
+import type { ChatScope, GamePlayer } from "@/lib/game/types";
+
+const CHAT_SCOPE_REGEX = /^(global|caste:(white|blue|black|red|green))$/;
+
+function parseScopeParam(value: string | null): ChatScope {
+  if (!value || !CHAT_SCOPE_REGEX.test(value)) return "global";
+  return value as ChatScope;
+}
 
 // @contracts: gameContract.getCommunityChat, gameContract.postCommunityChat
 void gameContract.getCommunityChat;
@@ -27,6 +36,10 @@ void gameContract.postCommunityChat;
 
 const PostBody = z.object({
   body: z.string().min(1).max(MAX_MESSAGE_LENGTH),
+  scope: z
+    .string()
+    .regex(CHAT_SCOPE_REGEX, "Invalid scope")
+    .optional(),
 });
 
 // GET /api/game/community/chat
@@ -38,8 +51,14 @@ export async function GET(request: NextRequest) {
   try {
     const user = await getVerifiedUser(request);
     if (!user) return apiError("Authentication required", 401);
-    const messages = await listRecentCommunityMessages(COMMUNITY_PAGE_SIZE);
-    const res = apiSuccess({ messages });
+    const scope = parseScopeParam(
+      new URL(request.url).searchParams.get("scope")
+    );
+    const messages = await listRecentCommunityMessages(
+      COMMUNITY_PAGE_SIZE,
+      scope
+    );
+    const res = apiSuccess({ messages, scope });
     res.headers.set(
       "Cache-Control",
       "private, max-age=10, must-revalidate"
@@ -101,6 +120,7 @@ export async function POST(request: NextRequest) {
       displayName: player?.displayName?.trim() || "Unknown general",
       caste: player?.caste ?? null,
       body: parsed.data.body,
+      scope: parsed.data.scope as ChatScope | undefined,
     });
     return apiSuccess({ message });
   } catch (error) {
@@ -109,6 +129,9 @@ export async function POST(request: NextRequest) {
     }
     if (error instanceof CommunityMessageTooLongError) {
       return apiError(error.message, 400);
+    }
+    if (error instanceof CommunityMessageWrongCasteError) {
+      return apiError(error.message, 403);
     }
     return apiError(
       error instanceof Error ? error.message : "Server error",

@@ -5,6 +5,7 @@
  */
 
 import {
+  applyBaseRegen,
   applyFlyoverModifiers,
   attributeAttackerLosses,
   attributeDefenderLosses,
@@ -654,6 +655,82 @@ describe("resolveAttack — intel-effect bonuses", () => {
       defaultDefender(),
       tile,
       makeSeededRng("zero")
+    );
+    expect(a.attackPower).toBe(b.attackPower);
+    expect(a.defensePower).toBe(b.defensePower);
+  });
+});
+
+describe("resolveAttack — hero bonuses (May 2026)", () => {
+  it("applies attacker.heroAttackBonus multiplicatively to attackPower", () => {
+    const tile = defaultTile(2000);
+    const baseline = resolveAttack(
+      defaultAttacker({ caste: "red" }),
+      defaultDefender({ caste: "white" }),
+      tile,
+      makeSeededRng("hero-attack-base")
+    );
+    const buffed = resolveAttack(
+      defaultAttacker({ caste: "red", heroAttackBonus: 0.2 }),
+      defaultDefender({ caste: "white" }),
+      tile,
+      makeSeededRng("hero-attack-base")
+    );
+    expect(buffed.attackPower).toBeCloseTo(baseline.attackPower * 1.2, 1);
+  });
+
+  it("applies defender.heroDefenseBonus multiplicatively to defensePower", () => {
+    const tile = defaultTile(2000);
+    const baseline = resolveAttack(
+      defaultAttacker({ caste: "red" }),
+      defaultDefender({ caste: "white" }),
+      tile,
+      makeSeededRng("hero-defense-base")
+    );
+    const buffed = resolveAttack(
+      defaultAttacker({ caste: "red" }),
+      defaultDefender({ caste: "white", heroDefenseBonus: 0.25 }),
+      tile,
+      makeSeededRng("hero-defense-base")
+    );
+    expect(buffed.defensePower).toBeCloseTo(baseline.defensePower * 1.25, 1);
+  });
+
+  it("stacks multiplicatively with intel bonuses (same numeric stage)", () => {
+    const tile = defaultTile(2000);
+    const baseline = resolveAttack(
+      defaultAttacker({ caste: "red" }),
+      defaultDefender({ caste: "white" }),
+      tile,
+      makeSeededRng("hero+intel")
+    );
+    const stacked = resolveAttack(
+      defaultAttacker({
+        caste: "red",
+        intelOffenseBonus: 0.1,
+        heroAttackBonus: 0.2,
+      }),
+      defaultDefender({ caste: "white" }),
+      tile,
+      makeSeededRng("hero+intel")
+    );
+    // 1.10 × 1.20 = 1.32
+    expect(stacked.attackPower).toBeCloseTo(baseline.attackPower * 1.32, 1);
+  });
+
+  it("zero hero bonus is a no-op", () => {
+    const tile = defaultTile(2000);
+    const a = resolveAttack(
+      defaultAttacker({ heroAttackBonus: 0 }),
+      defaultDefender({ heroDefenseBonus: 0 }),
+      tile,
+      makeSeededRng("hero-zero")
+    );
+    const b = resolveAttack(
+      defaultAttacker(),
+      defaultDefender(),
+      tile,
+      makeSeededRng("hero-zero")
     );
     expect(a.attackPower).toBe(b.attackPower);
     expect(a.defensePower).toBe(b.defensePower);
@@ -1718,5 +1795,55 @@ describe("resolveAttack — BASE retention on capture", () => {
     expect(result.outcome).toBe("captured");
     expect(result.captureBaseRetentionFactor).toBeLessThan(1);
     expect(result.captureBaseRetentionFactor).toBeGreaterThan(0);
+  });
+});
+
+describe("applyBaseRegen", () => {
+  const twoHoursAgo = new Date("2026-01-01T10:00:00Z");
+  const now = new Date("2026-01-01T12:00:00Z");
+
+  it("returns zero delta when land type has no regen rate", () => {
+    const result = applyBaseRegen({
+      currentBase: stack(0, 0, 0),
+      target: stack(10, 0, 0),
+      landType: "unrevealed",
+      baseRegenedAt: twoHoursAgo,
+      now,
+    });
+    expect(result.deltaUnits).toBe(0);
+    expect(result.baseUnits).toEqual(stack(0, 0, 0));
+  });
+
+  it("regenerates BASE toward target proportional to elapsed hours", () => {
+    const result = applyBaseRegen({
+      currentBase: stack(0, 0, 0),
+      target: stack(20, 0, 0),
+      landType: "military",
+      baseRegenedAt: twoHoursAgo,
+      now,
+    });
+    expect(result.deltaUnits).toBeGreaterThan(0);
+    expect(result.baseUnits.ground).toBeGreaterThan(0);
+    expect(result.baseUnits.ground).toBeLessThanOrEqual(20);
+  });
+
+  it("distributes remainder across types with deficits", () => {
+    const result = applyBaseRegen({
+      currentBase: stack(0, 0, 5),
+      target: stack(10, 10, 10),
+      landType: "military",
+      baseRegenedAt: new Date("2026-01-01T00:00:00Z"),
+      now: new Date("2026-01-01T24:00:00Z"),
+    });
+    expect(result.deltaUnits).toBeGreaterThan(0);
+    expect(result.baseUnits.ground).toBeGreaterThan(0);
+    expect(result.baseUnits.siege).toBeGreaterThan(0);
+  });
+});
+
+describe("distributeUnitKills remainder assignment", () => {
+  it("assigns leftover kills when fractional parts tie", () => {
+    const k = distributeUnitKills(stack(3, 3, 3), 4);
+    expect(k.ground + k.siege + k.air).toBe(4);
   });
 });

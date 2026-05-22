@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -15,14 +16,23 @@ import {
   baseUnitsTarget,
   computeTileCapacity,
   distributeUnitKills,
+  magicMultiplier,
   makeSeededRng,
   realizedSpellMagnitude,
   resolveAttack,
   rollSpellEffectiveness,
 } from "./combat";
 import { ARTIFACTS_BY_ID, SPELLS_BY_ID } from "./content";
+import {
+  ARMAGEDDON_TILE_GATE,
+  ARMAGEDDON_TURN_COST,
+  SEAL_COUNT,
+  computeArmageddonSuccessChanceFromMultiplier,
+} from "./content/armageddon";
 import { rollArtifact } from "./artifacts";
 import { logCommunityEventInTx } from "./community";
+import { markPactsBrokenInTx } from "./pacts";
+import { resolveProphesiesForSealInTx } from "./prophecies";
 import { buildIntelReportServer } from "./intel";
 import {
   deleteIntelEffectsInTx,
@@ -44,6 +54,7 @@ import {
 } from "./turn-report";
 import { notifyConquest } from "./discord-game";
 import { logger } from "@/lib/logger";
+import { sanitizeText } from "@/lib/sanitize";
 import {
   paginateFirestoreQuery,
   paginateInMemory,
@@ -69,23 +80,90 @@ import {
   validateRemoveUpgrade,
 } from "./upgrades";
 import {
+  DEFENSIVE_STANCE_LOCK_MS,
+  LAST_STAND_COOLDOWN_MS,
+  LAST_STAND_THREAT_WINDOW_MS,
+  LAST_STAND_WINDOW_MS,
+  MEDITATION_DURATION_MS,
+  MEDITATION_MAX_ACTIVE_SLOTS,
+  OATHBREAKER_ATTACK_PENALTY,
+  OATHBREAKER_DURATION_MS,
+  PEP_TALK_STAMINA_GAIN,
+  REDISTRIBUTE_MAX_PER_DAY,
   SIEGE_ACTION_MAGNITUDE,
   SIEGE_DEBUFF_MAX_MAGNITUDE,
+  type ArmageddonEventRecord,
   type ArtifactDefinition,
   type Caste,
   type CombatResult,
   type GameArtifact,
   type GameAttack,
+  type GameHero,
   type GamePlayer,
   type GameTile,
+  type GameWorldMeta,
+  type HeroBattleAction,
   type IntelReport,
   type LandType,
   type MapTile,
+  type SealRecord,
+  type SpecialUnitInstance,
+  type SpellDefinition,
   type TurnAction,
   type TurnReport,
   type UnitStack,
   type UnitType,
 } from "./types";
+import {
+  CONVERSION_SUCCESS_CEILING,
+  FARM_HERO_GLOBAL_RECRUIT_BONUS,
+  FARM_HERO_GLOBAL_RECRUIT_CAP,
+  FARM_SPECIAL_UNIT_ROLL,
+  HERO_ATTACK_BONUS,
+  HERO_DEFENSE_BONUS,
+  MAGIC_HERO_SPELL_BOOST,
+  MAGIC_HERO_VIRTUAL_LANDS,
+  POST_CONVERT_STAMINA,
+  SPARE_STAMINA_MULT,
+  STAMINA_CONVERSION_THRESHOLD,
+  conversionSuccessChance,
+  specialtyArmageddonMult,
+  specialtyAttackMult,
+  specialtyCastingMult,
+  specialtyDefenseMult,
+  specialtyKingdomBuffMult,
+  specialtyRecruitMult,
+  specialtyTypeRecruitMult,
+  staminaScale,
+} from "./content/heroes";
+import {
+  SPECIAL_UNITS_BY_ID,
+  pickSpecialUnitDef,
+} from "./content/special-units/_index";
+import {
+  applyEngagement,
+  applyStaminaRegen,
+  maybeEmergeHero,
+} from "./heroes";
+import {
+  computeZeroTurnDefenseBonus,
+  isHeroMeditating,
+  isTileInDefensiveStance,
+  oathbreakerAttackPenalty,
+} from "./zero-turn";
+import { findActivePactsBetween } from "./pacts";
+import {
+  markOrderResultInTx,
+  readQueuedOrdersForPlayer,
+} from "./orders";
+import type { QueuedOrder } from "./types";
+import {
+  appendHeroEventInTx,
+  heroEvent,
+  markHeroDeceasedInTx,
+  transferHeroOwnerInTx,
+  upsertHeroInTx,
+} from "./hero-registry";
 import {
   type AxialCoord,
   axialFromTileId,
@@ -129,6 +207,153 @@ export const BUILD_UNITS_PER_TURN_BY_LAND: Record<LandType, number> = {
 };
 export function unitsPerTurnForLand(landType: LandType): number {
   return BUILD_UNITS_PER_TURN_BY_LAND[landType] ?? 0;
+}
+
+// ── Hero helpers ─────────────────────────────────────────────────────────
+//
+// Small, pure-ish helpers that fold the player's hero roster into the
+// per-action effects (recruitment buff, virtual magic lands for Armageddon,
+// stationed special-unit combat bonus). The full Heroes design lives in
+// lib/game/heroes.ts (pure) and lib/game/content/heroes.ts (tuning).
+
+/** Sum of farm-hero kingdom-wide recruitment bonus across the player's
+ *  food tiles, capped at FARM_HERO_GLOBAL_RECRUIT_CAP. Each hero's
+ *  contribution is stamina-scaled and specialty-weighted (the
+ *  `kingdom-buff` specialty doubles it). Returns a fraction in
+ *  [0, FARM_HERO_GLOBAL_RECRUIT_CAP]. */
+function computeFarmHeroKingdomBuff(
+  heroes: ReadonlyArray<GameHero>,
+  ownerTurnsSpentTotal: number,
+  now: Date = new Date()
+): number {
+  let total = 0;
+  for (const hero of heroes) {
+    if (hero.class !== "farm") continue;
+    if (isHeroMeditating(hero, now)) continue;
+    const regened = applyStaminaRegen(hero, ownerTurnsSpentTotal);
+    total +=
+      FARM_HERO_GLOBAL_RECRUIT_BONUS *
+      staminaScale(regened) *
+      specialtyKingdomBuffMult(regened);
+  }
+  return Math.min(FARM_HERO_GLOBAL_RECRUIT_CAP, total);
+}
+
+/** Sum of magic-hero "virtual magic lands" the player contributes to
+ *  their own Armageddon `magicMultiplier` input. Each hero is stamina-
+ *  scaled; the "armageddon" specialty doubles, "spellcasting" gives a
+ *  small bump. Fractional — magicMultiplier handles the curve. */
+function countMagicHeroVirtualLands(
+  heroes: ReadonlyArray<GameHero>,
+  ownerTurnsSpentTotal: number,
+  now: Date = new Date()
+): number {
+  let total = 0;
+  for (const hero of heroes) {
+    if (hero.class !== "magic") continue;
+    if (isHeroMeditating(hero, now)) continue;
+    const regened = applyStaminaRegen(hero, ownerTurnsSpentTotal);
+    total +=
+      MAGIC_HERO_VIRTUAL_LANDS *
+      staminaScale(regened) *
+      specialtyArmageddonMult(regened);
+  }
+  return total;
+}
+
+/** Sum of stationed special-unit attack and defense bonuses for one
+ *  specific tile. Reads `player.summonableSpecialUnits` (only entries
+ *  with `stationedTileId === tileId` contribute). Defs resolved via
+ *  SPECIAL_UNITS_BY_ID — entries pointing at an unknown defId are
+ *  silently skipped (content was removed) rather than throwing. */
+function computeStationedSpecialUnitBonuses(
+  player: GamePlayer,
+  tileId: string
+): { attackBonus: number; defenseBonus: number } {
+  let attackBonus = 0;
+  let defenseBonus = 0;
+  const stationed = player.summonableSpecialUnits ?? [];
+  for (const instance of stationed) {
+    if (instance.stationedTileId !== tileId) continue;
+    const def = SPECIAL_UNITS_BY_ID.get(instance.defId);
+    if (!def) continue;
+    attackBonus += def.attackBonus;
+    defenseBonus += def.defenseBonus;
+  }
+  return { attackBonus, defenseBonus };
+}
+
+/** Total hero attack bonus for an attacker source tile. Folds the
+ *  military-hero multiplicative bonus (stamina + specialty) with the
+ *  stationed special-unit attackBonus on the same tile. Returns a fraction
+ *  (e.g. 0.25 = +25% attack). Both contributions are additive in the
+ *  returned fraction; combat.ts applies (1 + bonus). */
+function combinedHeroAttackBonus(
+  player: GamePlayer,
+  sourceTile: GameTile,
+  targetTile: Pick<GameTile, "type">,
+  now: Date = new Date()
+): number {
+  let bonus = 0;
+  if (
+    sourceTile.hero &&
+    sourceTile.hero.class === "military" &&
+    !isHeroMeditating(sourceTile.hero, now)
+  ) {
+    const h = applyStaminaRegen(sourceTile.hero, player.turnsSpentTotal);
+    bonus +=
+      HERO_ATTACK_BONUS *
+      staminaScale(h) *
+      specialtyAttackMult(h, targetTile.type);
+  }
+  // Special units summoned to the source tile add a small multiplicative
+  // bump — total special-unit attack stat divided by 1000 keeps the
+  // numbers in the same order of magnitude as the military-hero bonus
+  // without piling unbounded combat power.
+  const stationed = computeStationedSpecialUnitBonuses(player, sourceTile.tileId);
+  bonus += stationed.attackBonus / 1000;
+  return bonus;
+}
+
+/** Mirror of `combinedHeroAttackBonus` for the defender side. */
+function combinedHeroDefenseBonus(
+  defender: GamePlayer,
+  targetTile: GameTile,
+  sourceTile: Pick<GameTile, "type">,
+  now: Date = new Date()
+): number {
+  let bonus = 0;
+  if (
+    targetTile.hero &&
+    targetTile.hero.class === "military" &&
+    !isHeroMeditating(targetTile.hero, now)
+  ) {
+    const h = applyStaminaRegen(targetTile.hero, defender.turnsSpentTotal);
+    bonus +=
+      HERO_DEFENSE_BONUS *
+      staminaScale(h) *
+      specialtyDefenseMult(h, sourceTile.type);
+  }
+  const stationed = computeStationedSpecialUnitBonuses(defender, targetTile.tileId);
+  bonus += stationed.defenseBonus / 1000;
+  return bonus;
+}
+
+/** Magic-hero spell-magnitude boost when casting `spell` from `sourceTile`.
+ *  Returns a multiplier (1.0 = no change). Stamina-scaled, specialty-weighted. */
+function magicHeroSpellMultiplier(
+  casterTurnsSpentTotal: number,
+  sourceTile: GameTile,
+  spell: Pick<SpellDefinition, "type">,
+  now: Date = new Date()
+): number {
+  if (!sourceTile.hero || sourceTile.hero.class !== "magic") return 1;
+  if (isHeroMeditating(sourceTile.hero, now)) return 1;
+  const h = applyStaminaRegen(sourceTile.hero, casterTurnsSpentTotal);
+  return (
+    1 +
+    MAGIC_HERO_SPELL_BOOST * staminaScale(h) * specialtyCastingMult(h, spell)
+  );
 }
 // Far expedition: 2× the normal explore cost. Lands a tile adjacent to a
 // random enemy tile, marked isolatedSpawn so the supply system applies the
@@ -285,6 +510,18 @@ export class GameArtifactAlreadyUsedError extends Error {
     this.name = "GameArtifactAlreadyUsedError";
   }
 }
+export class GamePlayerBioTooLongError extends Error {
+  constructor() {
+    super("Bio cannot exceed 500 characters");
+    this.name = "GamePlayerBioTooLongError";
+  }
+}
+export class GameInscriptionTooLongError extends Error {
+  constructor() {
+    super("Inscription cannot exceed 120 characters");
+    this.name = "GameInscriptionTooLongError";
+  }
+}
 export class GameInvalidNameError extends Error {
   constructor(reason: string) {
     super(`Invalid general name: ${reason}`);
@@ -306,6 +543,132 @@ export class GameNoEnemyKingdomsError extends Error {
   }
 }
 
+export class GameArmageddonInProgressError extends Error {
+  constructor() {
+    super(
+      "Armageddon is upon us. The world is being remade — turn-spending actions are temporarily refused."
+    );
+    this.name = "GameArmageddonInProgressError";
+  }
+}
+
+export class GameStaleSeasonError extends Error {
+  constructor(playerSeason: number, worldSeason: number) {
+    super(
+      `Your record is from season ${playerSeason}, but the current season is ${worldSeason}. Claim your fresh spawn to continue.`
+    );
+    this.name = "GameStaleSeasonError";
+  }
+}
+
+export class GameSealsExhaustedError extends Error {
+  constructor() {
+    super(
+      "All seven Seals have been broken — Armageddon is already underway."
+    );
+    this.name = "GameSealsExhaustedError";
+  }
+}
+
+/** Thrown when summon/unsummon references a special-unit instance the
+ *  player doesn't have in their pool. */
+export class GameSpecialUnitNotFoundError extends Error {
+  constructor(instanceId: string) {
+    super(`Special unit instance ${instanceId} not found in your pool.`);
+    this.name = "GameSpecialUnitNotFoundError";
+  }
+}
+
+/** Thrown when a special-unit summon targets a tile that already has the
+ *  same instance stationed (idempotency guard) or is already stationed
+ *  somewhere else (caller must unsummon first). */
+export class GameSpecialUnitAlreadyStationedError extends Error {
+  constructor() {
+    super(
+      "This special unit is already stationed. Unsummon it first to move it."
+    );
+    this.name = "GameSpecialUnitAlreadyStationedError";
+  }
+}
+
+// Zero-turn gameplay errors -----------------------------------------------
+export class GameDefensiveStanceBlockedError extends Error {
+  constructor() {
+    super(
+      "This tile is in defensive stance and cannot attack until the stance lifts."
+    );
+    this.name = "GameDefensiveStanceBlockedError";
+  }
+}
+export class GameDefensiveStanceLockedError extends Error {
+  constructor() {
+    super(
+      "Defensive stance is still locked. You cannot exit stance until the cooldown elapses."
+    );
+    this.name = "GameDefensiveStanceLockedError";
+  }
+}
+export class GameDefensiveStanceCapError extends Error {
+  constructor(public cap: number) {
+    super(`You can have at most ${cap} tile(s) in defensive stance.`);
+    this.name = "GameDefensiveStanceCapError";
+  }
+}
+export class GameMeditationSlotFullError extends Error {
+  constructor() {
+    super("You already have a hero in meditation.");
+    this.name = "GameMeditationSlotFullError";
+  }
+}
+export class GameHeroAlreadyMeditatingError extends Error {
+  constructor() {
+    super("That hero is already meditating.");
+    this.name = "GameHeroAlreadyMeditatingError";
+  }
+}
+export class GameHeroNotOwnedError extends Error {
+  constructor() {
+    super("That hero is not yours.");
+    this.name = "GameHeroNotOwnedError";
+  }
+}
+export class GameHeroNotFoundError extends Error {
+  constructor() {
+    super("Hero not found.");
+    this.name = "GameHeroNotFoundError";
+  }
+}
+export class GamePepTalkRequiresZeroTurnsError extends Error {
+  constructor() {
+    super("Pep talks are only available when you have 0 turns remaining.");
+    this.name = "GamePepTalkRequiresZeroTurnsError";
+  }
+}
+export class GameRedistributeRateLimitError extends Error {
+  constructor(public retryAfterMs: number) {
+    super("You've used your daily redistribution allowance.");
+    this.name = "GameRedistributeRateLimitError";
+  }
+}
+export class GameLastStandCooldownError extends Error {
+  constructor(public retryAfterMs: number) {
+    super("Last Stand is still on cooldown.");
+    this.name = "GameLastStandCooldownError";
+  }
+}
+export class GameLastStandRequiresZeroTurnsError extends Error {
+  constructor() {
+    super("Last Stand is only available when you have 0 turns remaining.");
+    this.name = "GameLastStandRequiresZeroTurnsError";
+  }
+}
+export class GameLastStandNoThreatError extends Error {
+  constructor() {
+    super("No inbound attack threat detected on that tile.");
+    this.name = "GameLastStandNoThreatError";
+  }
+}
+
 const COLLECTIONS = {
   PLAYERS: "game_players",
   TILES: "game_tiles",
@@ -319,6 +682,13 @@ const COLLECTIONS = {
   // Community chat: free-form messages from authenticated players,
   // moderated by author or by an admin (delete-only).
   COMMUNITY_MESSAGES: "game_community_messages",
+  // End-game / Armageddon hall-of-fame: one doc per past Armageddon
+  // (doc id = seasonNumber). Persisted before the wipe so the record
+  // survives even if the resolver crashes mid-batch.
+  ARMAGEDDON_EVENTS: "game_armageddon_events",
+  // Zero-turn gameplay: queued battle plans that execute at next weekly
+  // grant. Owned by player; writes Admin-SDK only.
+  ORDER_QUEUE: "game_order_queue",
 } as const;
 
 const WORLD_META_DOC = "singleton";
@@ -339,6 +709,69 @@ function adminDbOrThrow() {
   const db = getAdminDb();
   if (!db) throw new Error("Firebase Admin not initialized");
   return db;
+}
+
+// ── End-game / Armageddon helpers ─────────────────────────────────────
+// Coalesce a possibly-pre-Armageddon worldMeta doc to a full GameWorldMeta
+// with safe defaults. Pre-Armageddon docs (and freshly-bootstrapped envs)
+// don't have sealsBroken / armageddonState / seasonNumber set; treat
+// season as 1 and state as "active" so legacy reads behave correctly.
+function defaultedWorldMeta(raw: Partial<GameWorldMeta> | undefined): GameWorldMeta {
+  return {
+    playerCount: raw?.playerCount ?? 0,
+    seasonNumber: raw?.seasonNumber ?? 1,
+    sealsBroken: raw?.sealsBroken ?? 0,
+    seals: raw?.seals ?? [],
+    armageddonState: raw?.armageddonState ?? "active",
+    armageddonStartedAt: raw?.armageddonStartedAt,
+    armageddonResolvedAt: raw?.armageddonResolvedAt,
+    lastSpawnAt: raw?.lastSpawnAt,
+    updatedAt: raw?.updatedAt,
+  };
+}
+
+/** Refuses turn-spending actions while the world is being remade. Also
+ *  refuses stale player docs (left over from a prior season after a
+ *  partial wipe — should be rare since the resolver deletes them, but
+ *  defends against the edge case). Call this immediately after reading
+ *  both the player doc and the worldMeta singleton inside a transaction. */
+function assertGameActiveInTx(
+  player: GamePlayer,
+  worldMeta: GameWorldMeta
+): void {
+  if (worldMeta.armageddonState && worldMeta.armageddonState !== "active") {
+    throw new GameArmageddonInProgressError();
+  }
+  const playerSeason = player.seasonNumber ?? 1;
+  const worldSeason = worldMeta.seasonNumber ?? 1;
+  if (playerSeason !== worldSeason) {
+    throw new GameStaleSeasonError(playerSeason, worldSeason);
+  }
+}
+
+/** Reads the world-meta singleton inside a transaction and returns a
+ *  fully-defaulted GameWorldMeta. Mutators that need to update meta should
+ *  hold the underlying doc reference; this helper just sources values. */
+async function readWorldMetaInTx(
+  tx: Transaction,
+  db: Firestore
+): Promise<{ meta: GameWorldMeta; ref: FirebaseFirestore.DocumentReference }> {
+  const ref = db.collection(COLLECTIONS.WORLD_META).doc(WORLD_META_DOC);
+  const snap = await tx.get(ref);
+  const raw = snap.exists ? (snap.data() as Partial<GameWorldMeta>) : undefined;
+  return { meta: defaultedWorldMeta(raw), ref };
+}
+
+/** Read-only world-meta fetch for dashboard / hall-of-fame surfacing.
+ *  Returns the defaulted shape even when the doc doesn't exist yet. */
+export async function getWorldMetaServer(): Promise<GameWorldMeta> {
+  const db = adminDbOrThrow();
+  const snap = await db
+    .collection(COLLECTIONS.WORLD_META)
+    .doc(WORLD_META_DOC)
+    .get();
+  const raw = snap.exists ? (snap.data() as Partial<GameWorldMeta>) : undefined;
+  return defaultedWorldMeta(raw);
 }
 
 // Rolls (3% chance) for an artifact and stages a tx.set() to persist it if
@@ -510,7 +943,8 @@ export async function getOwnedMapTilesServer(
       "ownerId",
       "units",
       "baseUnits",
-      "armedDefenseSpellId"
+      "armedDefenseSpellId",
+      "hero"
     )
     .get();
   return snap.docs.map((d) => {
@@ -524,6 +958,7 @@ export async function getOwnedMapTilesServer(
       units: data.units,
       baseUnits: data.baseUnits ?? { ground: 0, siege: 0, air: 0 },
       armedDefenseSpellId: data.armedDefenseSpellId ?? null,
+      ...(data.hero ? { hero: data.hero } : {}),
     } as MapTile;
   });
 }
@@ -544,7 +979,8 @@ export async function getAllMapTilesServer(): Promise<MapTile[]> {
       "ownerId",
       "units",
       "baseUnits",
-      "armedDefenseSpellId"
+      "armedDefenseSpellId",
+      "hero"
     )
     .get();
   return snap.docs.map((d) => {
@@ -558,6 +994,7 @@ export async function getAllMapTilesServer(): Promise<MapTile[]> {
       units: data.units,
       baseUnits: data.baseUnits ?? { ground: 0, siege: 0, air: 0 },
       armedDefenseSpellId: data.armedDefenseSpellId ?? null,
+      ...(data.hero ? { hero: data.hero } : {}),
     } as MapTile;
   });
 }
@@ -593,7 +1030,8 @@ export async function getMapTilesInBoundsServer(bounds: {
       "ownerId",
       "units",
       "baseUnits",
-      "armedDefenseSpellId"
+      "armedDefenseSpellId",
+      "hero"
     )
     .limit(VIEWPORT_TILE_LIMIT + 1)
     .get();
@@ -616,6 +1054,7 @@ export async function getMapTilesInBoundsServer(bounds: {
       units: data.units,
       baseUnits: data.baseUnits ?? { ground: 0, siege: 0, air: 0 },
       armedDefenseSpellId: data.armedDefenseSpellId ?? null,
+      ...(data.hero ? { hero: data.hero } : {}),
     } as MapTile);
   }
   return out;
@@ -1520,6 +1959,19 @@ function isValidUnitStack(s: unknown): s is UnitStack {
 async function getOwnedLandCounts(
   userId: string
 ): Promise<Record<"food" | "magic" | "military", number>> {
+  const summary = await getOwnedTileSummary(userId);
+  return summary.counts;
+}
+
+/** Scans the player's owned military/food/magic tiles once and returns
+ *  both the land-type counts and the list of heroes stationed on them.
+ *  Used by callers that need to compute farm-hero kingdom buffs or
+ *  magic-hero Armageddon contributions alongside the standard land counts.
+ *  Single Firestore query — no extra cost over `getOwnedLandCounts`. */
+async function getOwnedTileSummary(userId: string): Promise<{
+  counts: Record<"food" | "magic" | "military", number>;
+  heroes: GameHero[];
+}> {
   const db = adminDbOrThrow();
   const snap = await db
     .collection(COLLECTIONS.TILES)
@@ -1527,11 +1979,15 @@ async function getOwnedLandCounts(
     .where("type", "in", ["food", "magic", "military"])
     .get();
   const counts = { food: 0, magic: 0, military: 0 };
+  const heroes: GameHero[] = [];
   for (const d of snap.docs) {
-    const t = (d.data() as GameTile).type;
-    if (t === "food" || t === "magic" || t === "military") counts[t] += 1;
+    const tile = d.data() as GameTile;
+    if (tile.type === "food" || tile.type === "magic" || tile.type === "military") {
+      counts[tile.type] += 1;
+    }
+    if (tile.hero) heroes.push(tile.hero);
   }
-  return counts;
+  return { counts, heroes };
 }
 
 // Builds units of `unitType` on `tileId`. Tile must be owned by the player
@@ -1551,7 +2007,12 @@ export async function buildUnitsServer(
   artifact: GameArtifact | null;
 }> {
   const db = adminDbOrThrow();
-  const counts = await getOwnedLandCounts(userId);
+  // Pre-txn read pulls both land counts and the player's hero roster in
+  // one Firestore query (see `getOwnedTileSummary`). The farm-hero
+  // kingdom buff is computed here so we never have to scan tiles inside
+  // the txn (Firestore txns can't query).
+  const summary = await getOwnedTileSummary(userId);
+  const counts = summary.counts;
 
   const tileRef = db.collection(COLLECTIONS.TILES).doc(tileId);
   const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(userId);
@@ -1568,12 +2029,32 @@ export async function buildUnitsServer(
     const tile = tileSnap.data() as GameTile;
 
     if (tile.ownerId !== userId) throw new GameTileNotOwnedError();
-    const unitsThisCycle = unitsPerTurnForLand(tile.type);
-    if (unitsThisCycle <= 0) {
-      // unrevealed/unassigned tiles can't recruit. Reuse the existing
-      // tile-type error so clients see a familiar shape.
+    // Recruit gate is on the land type itself — unrevealed/unassigned
+    // tiles have no base production. Heroes multiply the rate but can't
+    // unlock a non-recruitable tile.
+    const baseUnitsThisCycle = unitsPerTurnForLand(tile.type);
+    if (baseUnitsThisCycle <= 0) {
       throw new GameTileTypeError("military", tile.type);
     }
+    // Farm-hero kingdom buff + per-tile-type specialty multiplier. The
+    // kingdom buff sums all farm heroes (capped); the specialty multiplier
+    // fires only when THIS tile's farm hero matches the unit type being
+    // recruited.
+    const farmHeroBuff = computeFarmHeroKingdomBuff(
+      summary.heroes,
+      player.turnsSpentTotal
+    );
+    const tileFarmHero =
+      tile.hero && tile.hero.class === "farm"
+        ? applyStaminaRegen(tile.hero, player.turnsSpentTotal)
+        : null;
+    const tileTypeMult = tileFarmHero
+      ? specialtyTypeRecruitMult(tileFarmHero, unitType)
+      : 1;
+    const unitsThisCycle = Math.max(
+      1,
+      Math.round(baseUnitsThisCycle * (1 + farmHeroBuff) * tileTypeMult)
+    );
     if (player.phase !== "play") {
       throw new GameInvalidPhaseError("play", player.phase);
     }
@@ -1601,8 +2082,61 @@ export async function buildUnitsServer(
     const artifact = rolled?.definition ?? null;
 
     const newUnits: UnitStack = { ...tile.units, [unitType]: tile.units[unitType] + unitsThisCycle };
-    tx.update(tileRef, { units: newUnits, updatedAt: now });
-    tx.update(playerRef, {
+
+    // Hero emergence (food tiles only). Rolls AFTER the recruit is locked
+    // in; if a hero emerges, persist on the tile and bump player heroCount.
+    let emergedHero: GameHero | null = null;
+    if (tile.type === "food" && tile.hero == null && player.caste) {
+      const emergeRng = makeSeededRng(`hero-emerge-build-${userId}-${turnsSpentTotal}`);
+      emergedHero = maybeEmergeHero({
+        class: "farm",
+        tile,
+        ownerId: userId,
+        ownerCaste: player.caste,
+        turnIndex: turnsSpentTotal,
+        rng: emergeRng,
+      });
+    }
+
+    // Special-unit roll: tile has a farm hero (regen-applied above) →
+    // each recruit gets a chance to spawn a caste-themed named unit into
+    // the player's summonable pool. Uses an independent rng so emergence
+    // and special-unit rolls don't share entropy.
+    let summonedSpecialUnit: SpecialUnitInstance | null = null;
+    if (
+      tileFarmHero &&
+      player.caste &&
+      pickSpecialUnitDef(player.caste, () => 0) !== null
+    ) {
+      const suRng = makeSeededRng(
+        `hero-special-unit-${userId}-${tileId}-${turnsSpentTotal}`
+      );
+      const chance =
+        FARM_SPECIAL_UNIT_ROLL * specialtyRecruitMult(tileFarmHero);
+      if (suRng() < chance) {
+        const def = pickSpecialUnitDef(player.caste, suRng);
+        if (def) {
+          summonedSpecialUnit = {
+            instanceId: randomUUID(),
+            defId: def.id,
+            spawnedAtTurn: turnsSpentTotal,
+          };
+        }
+      }
+    }
+
+    const heroOnTileNext = emergedHero ?? tile.hero ?? null;
+    const tileUpdate: Partial<GameTile> & { updatedAt: Date } = {
+      units: newUnits,
+      updatedAt: now,
+    };
+    if (emergedHero) tileUpdate.hero = emergedHero;
+    tx.update(tileRef, tileUpdate);
+
+    const nextSummonableSpecialUnits = summonedSpecialUnit
+      ? [...(player.summonableSpecialUnits ?? []), summonedSpecialUnit]
+      : player.summonableSpecialUnits;
+    const playerUpdate: Record<string, unknown> = {
       turnsRemaining: player.turnsRemaining - BUILD_UNITS_TURN_COST,
       turnsSpentTotal,
       stats: {
@@ -1610,7 +2144,77 @@ export async function buildUnitsServer(
         unitsAlive: player.stats.unitsAlive + unitsThisCycle,
       },
       updatedAt: now,
-    });
+    };
+    if (emergedHero) {
+      playerUpdate.heroCount = (player.heroCount ?? 0) + 1;
+    }
+    if (nextSummonableSpecialUnits) {
+      playerUpdate.summonableSpecialUnits = nextSummonableSpecialUnits;
+    }
+    tx.update(playerRef, playerUpdate);
+
+    if (emergedHero) {
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "hero_emerged",
+          actorUserId: userId,
+          actorDisplayName: player.displayName,
+          actorCaste: player.caste,
+          tileId,
+          heroId: emergedHero.id,
+          heroName: emergedHero.name,
+          heroClass: emergedHero.class,
+          heroSpecialty: emergedHero.specialty,
+        },
+        now
+      );
+    }
+
+    // v2 registry: dual-write the persistent record + an `emerged` event
+    // on emergence, and a `recruited` / `special_unit_summoned` event on
+    // the relevant tile's farm hero (regen-applied above as `tileFarmHero`).
+    const playerSeasonNumber = player.seasonNumber ?? 1;
+    if (emergedHero) {
+      upsertHeroInTx({ tx, db, hero: emergedHero, seasonNumber: playerSeasonNumber, now });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: emergedHero.id,
+        event: heroEvent.emerged(emergedHero, playerSeasonNumber),
+        now,
+      });
+    }
+    if (tileFarmHero) {
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: tileFarmHero.id,
+        event: heroEvent.recruited({
+          tileId,
+          ownerIdAtTime: userId,
+          unitType,
+          unitsBuilt: unitsThisCycle,
+          seasonNumber: playerSeasonNumber,
+        }),
+        now,
+      });
+      if (summonedSpecialUnit) {
+        appendHeroEventInTx({
+          tx,
+          db,
+          heroId: tileFarmHero.id,
+          event: heroEvent.specialUnitSummoned({
+            tileId,
+            ownerIdAtTime: userId,
+            specialUnitDefId: summonedSpecialUnit.defId,
+            seasonNumber: playerSeasonNumber,
+          }),
+          now,
+        });
+      }
+    }
 
     const report = buildBuildReport({
       turnIndex: turnsSpentTotal,
@@ -1620,6 +2224,16 @@ export async function buildUnitsServer(
       unitsBuilt: unitsThisCycle,
       artifactFound: artifact,
       rng: makeNarrativeRng(userId, turnsSpentTotal, "build"),
+      heroEmerged: emergedHero,
+      specialUnitSummoned: summonedSpecialUnit
+        ? {
+            instanceId: summonedSpecialUnit.instanceId,
+            defId: summonedSpecialUnit.defId,
+            name:
+              SPECIAL_UNITS_BY_ID.get(summonedSpecialUnit.defId)?.name ??
+              summonedSpecialUnit.defId,
+          }
+        : null,
     });
 
     return {
@@ -1631,9 +2245,18 @@ export async function buildUnitsServer(
           ...player.stats,
           unitsAlive: player.stats.unitsAlive + unitsThisCycle,
         },
+        heroCount: emergedHero
+          ? (player.heroCount ?? 0) + 1
+          : player.heroCount,
+        summonableSpecialUnits: nextSummonableSpecialUnits,
         updatedAt: now,
       },
-      tile: { ...tile, units: newUnits, updatedAt: now },
+      tile: {
+        ...tile,
+        units: newUnits,
+        hero: heroOnTileNext ?? undefined,
+        updatedAt: now,
+      },
       produced: unitsThisCycle,
       report,
       artifact: rolled?.doc ?? null,
@@ -1691,8 +2314,10 @@ export async function bulkBuildUnitsServer(
   }
 
   const db = adminDbOrThrow();
-  // One owned-tiles query for the cap math, outside the txn.
-  const counts = await getOwnedLandCounts(userId);
+  // One owned-tiles query, pulled with hero data (used for the kingdom-wide
+  // farm-hero recruit buff inside the loop).
+  const summary = await getOwnedTileSummary(userId);
+  const counts = summary.counts;
   const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(userId);
   // Dedupe tile refs in case the plan visits the same tile twice (round-robin
   // over a small mil-tile pool will). We still issue one tx.update per tile
@@ -1734,6 +2359,9 @@ export async function bulkBuildUnitsServer(
     let unitsAlive = player.stats.unitsAlive;
     let turnsRemaining = player.turnsRemaining;
     let turnsSpentTotal = player.turnsSpentTotal;
+    let heroCount = player.heroCount ?? 0;
+    let summonableSpecialUnits: SpecialUnitInstance[] | undefined =
+      player.summonableSpecialUnits;
     let stoppedEarly: string | undefined;
 
     const reports: TurnReport[] = [];
@@ -1741,11 +2369,30 @@ export async function bulkBuildUnitsServer(
     let stepIndex = 0;
     let producedTotal = 0;
 
+    // Farm-hero kingdom buff is fixed for the whole bulk session — we
+    // computed it from the pre-txn summary. (Re-computing per cycle would
+    // mean a 2nd query inside the txn, which Firestore can't do.)
+    const farmHeroBuff = computeFarmHeroKingdomBuff(
+      summary.heroes,
+      player.turnsSpentTotal
+    );
+
     outer: for (const entry of plan) {
       for (let c = 0; c < entry.cycles; c++) {
         const isFirst = stepIndex === 0;
         const before = tilesById.get(entry.tileId)!;
-        const unitsThisCycle = unitsPerTurnForLand(before.type);
+        const baseUnitsThisCycle = unitsPerTurnForLand(before.type);
+        const tileFarmHero =
+          before.hero && before.hero.class === "farm"
+            ? applyStaminaRegen(before.hero, turnsSpentTotal)
+            : null;
+        const tileTypeMult = tileFarmHero
+          ? specialtyTypeRecruitMult(tileFarmHero, entry.unitType)
+          : 1;
+        const unitsThisCycle = Math.max(
+          1,
+          Math.round(baseUnitsThisCycle * (1 + farmHeroBuff) * tileTypeMult)
+        );
 
         if (turnsRemaining < BUILD_UNITS_TURN_COST) {
           if (isFirst) {
@@ -1781,6 +2428,114 @@ export async function bulkBuildUnitsServer(
         const artifact = rolled?.definition ?? null;
         if (rolled) artifacts.push(rolled.doc);
 
+        // Hero emergence on food tiles (only when the tile doesn't already
+        // have one). Seed includes stepIndex so each cycle rolls fresh.
+        let emergedHero: GameHero | null = null;
+        if (before.type === "food" && before.hero == null && player.caste) {
+          const emergeRng = makeSeededRng(
+            `hero-emerge-bulkbuild-${userId}-${turnsSpentTotal}-${stepIndex}`
+          );
+          emergedHero = maybeEmergeHero({
+            class: "farm",
+            tile: before,
+            ownerId: userId,
+            ownerCaste: player.caste,
+            turnIndex: turnsSpentTotal,
+            rng: emergeRng,
+          });
+          if (emergedHero) {
+            heroCount += 1;
+            logCommunityEventInTx(
+              tx,
+              db,
+              {
+                kind: "hero_emerged",
+                actorUserId: userId,
+                actorDisplayName: player.displayName,
+                actorCaste: player.caste,
+                tileId: entry.tileId,
+                heroId: emergedHero.id,
+                heroName: emergedHero.name,
+                heroClass: emergedHero.class,
+                heroSpecialty: emergedHero.specialty,
+              },
+              now
+            );
+            // v2 registry: create persistent record + emergence event.
+            const seasonNumberLocal = player.seasonNumber ?? 1;
+            upsertHeroInTx({
+              tx,
+              db,
+              hero: emergedHero,
+              seasonNumber: seasonNumberLocal,
+              now,
+            });
+            appendHeroEventInTx({
+              tx,
+              db,
+              heroId: emergedHero.id,
+              event: heroEvent.emerged(emergedHero, seasonNumberLocal),
+              now,
+            });
+          }
+        }
+
+        // v2 registry: log a `recruited` event on the existing farm hero
+        // on this tile (if any), so hero history reflects the recruit.
+        if (tileFarmHero) {
+          const seasonNumberLocal = player.seasonNumber ?? 1;
+          appendHeroEventInTx({
+            tx,
+            db,
+            heroId: tileFarmHero.id,
+            event: heroEvent.recruited({
+              tileId: entry.tileId,
+              ownerIdAtTime: userId,
+              unitType: entry.unitType,
+              unitsBuilt: unitsThisCycle,
+              seasonNumber: seasonNumberLocal,
+            }),
+            now,
+          });
+        }
+
+        // Special-unit roll on a farm-hero tile.
+        let summonedSpecialUnit: SpecialUnitInstance | null = null;
+        if (tileFarmHero && player.caste) {
+          const suRng = makeSeededRng(
+            `hero-special-unit-bulkbuild-${userId}-${entry.tileId}-${turnsSpentTotal}-${stepIndex}`
+          );
+          const chance =
+            FARM_SPECIAL_UNIT_ROLL * specialtyRecruitMult(tileFarmHero);
+          if (suRng() < chance) {
+            const def = pickSpecialUnitDef(player.caste, suRng);
+            if (def) {
+              summonedSpecialUnit = {
+                instanceId: randomUUID(),
+                defId: def.id,
+                spawnedAtTurn: turnsSpentTotal,
+              };
+              summonableSpecialUnits = [
+                ...(summonableSpecialUnits ?? []),
+                summonedSpecialUnit,
+              ];
+              // v2 registry event for the farm hero.
+              appendHeroEventInTx({
+                tx,
+                db,
+                heroId: tileFarmHero.id,
+                event: heroEvent.specialUnitSummoned({
+                  tileId: entry.tileId,
+                  ownerIdAtTime: userId,
+                  specialUnitDefId: def.id,
+                  seasonNumber: player.seasonNumber ?? 1,
+                }),
+                now,
+              });
+            }
+          }
+        }
+
         const after: GameTile = {
           ...before,
           units: {
@@ -1788,6 +2543,7 @@ export async function bulkBuildUnitsServer(
             [entry.unitType]:
               before.units[entry.unitType] + unitsThisCycle,
           },
+          hero: emergedHero ?? before.hero,
           updatedAt: now,
         };
         tilesById.set(entry.tileId, after);
@@ -1801,6 +2557,16 @@ export async function bulkBuildUnitsServer(
             unitsBuilt: unitsThisCycle,
             artifactFound: artifact,
             rng: makeNarrativeRng(userId, turnsSpentTotal, "build"),
+            heroEmerged: emergedHero,
+            specialUnitSummoned: summonedSpecialUnit
+              ? {
+                  instanceId: summonedSpecialUnit.instanceId,
+                  defId: summonedSpecialUnit.defId,
+                  name:
+                    SPECIAL_UNITS_BY_ID.get(summonedSpecialUnit.defId)?.name ??
+                    summonedSpecialUnit.defId,
+                }
+              : null,
           })
         );
 
@@ -1808,20 +2574,33 @@ export async function bulkBuildUnitsServer(
       }
     }
 
-    // Stage tile writes once each (not per cycle).
+    // Stage tile writes once each (not per cycle). Each write may include
+    // a fresh hero if emergence fired on that tile during the loop.
     for (const id of uniqueTileIds) {
       const after = tilesById.get(id)!;
       const ref = db.collection(COLLECTIONS.TILES).doc(id);
-      tx.update(ref, { units: after.units, updatedAt: now });
+      const tileWrite: Record<string, unknown> = {
+        units: after.units,
+        updatedAt: now,
+      };
+      if (after.hero) tileWrite.hero = after.hero;
+      tx.update(ref, tileWrite);
     }
 
     if (stepIndex > 0) {
-      tx.update(playerRef, {
+      const playerUpdate: Record<string, unknown> = {
         turnsRemaining,
         turnsSpentTotal,
         stats: { ...player.stats, unitsAlive },
         updatedAt: now,
-      });
+      };
+      if (heroCount !== (player.heroCount ?? 0)) {
+        playerUpdate.heroCount = heroCount;
+      }
+      if (summonableSpecialUnits !== player.summonableSpecialUnits) {
+        playerUpdate.summonableSpecialUnits = summonableSpecialUnits;
+      }
+      tx.update(playerRef, playerUpdate);
     }
 
     const updatedPlayer: GamePlayer = {
@@ -1829,6 +2608,8 @@ export async function bulkBuildUnitsServer(
       turnsRemaining,
       turnsSpentTotal,
       stats: { ...player.stats, unitsAlive },
+      heroCount,
+      summonableSpecialUnits,
       updatedAt: now,
     };
     const updatedTiles: GameTile[] = uniqueTileIds.map(
@@ -1911,12 +2692,76 @@ export async function armDefenseSpellServer(
     );
     const artifact = rolled?.definition ?? null;
 
-    tx.update(tileRef, { armedDefenseSpellId: spellId, updatedAt: now });
-    tx.update(playerRef, {
+    // Magic hero emergence on magic tiles when armed. Tile must not already
+    // have a hero. Note: arming this spell counts as a "cast from this tile"
+    // for emergence purposes; the hero's actual spell boost is applied when
+    // the spell triggers in combat (defender side), not at arm time.
+    let emergedHero: GameHero | null = null;
+    if (tile.type === "magic" && tile.hero == null && player.caste) {
+      const emergeRng = makeSeededRng(
+        `hero-emerge-arm-${userId}-${turnsSpentTotal}`
+      );
+      emergedHero = maybeEmergeHero({
+        class: "magic",
+        tile,
+        ownerId: userId,
+        ownerCaste: player.caste,
+        turnIndex: turnsSpentTotal,
+        rng: emergeRng,
+      });
+    }
+
+    const tileUpdate: Record<string, unknown> = {
+      armedDefenseSpellId: spellId,
+      updatedAt: now,
+    };
+    if (emergedHero) tileUpdate.hero = emergedHero;
+    tx.update(tileRef, tileUpdate);
+
+    const playerUpdate: Record<string, unknown> = {
       turnsRemaining: player.turnsRemaining - cost,
       turnsSpentTotal,
       updatedAt: now,
-    });
+    };
+    if (emergedHero) {
+      playerUpdate.heroCount = (player.heroCount ?? 0) + 1;
+    }
+    tx.update(playerRef, playerUpdate);
+
+    if (emergedHero) {
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "hero_emerged",
+          actorUserId: userId,
+          actorDisplayName: player.displayName,
+          actorCaste: player.caste,
+          tileId,
+          heroId: emergedHero.id,
+          heroName: emergedHero.name,
+          heroClass: emergedHero.class,
+          heroSpecialty: emergedHero.specialty,
+        },
+        now
+      );
+      // v2 registry: persist + emergence event.
+      const seasonNumberLocal = player.seasonNumber ?? 1;
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: emergedHero,
+        seasonNumber: seasonNumberLocal,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: emergedHero.id,
+        event: heroEvent.emerged(emergedHero, seasonNumberLocal),
+        now,
+      });
+    }
 
     const report = buildArmDefenseReport({
       turnIndex: turnsSpentTotal,
@@ -1926,6 +2771,7 @@ export async function armDefenseSpellServer(
       spellName: spell.name,
       artifactFound: artifact,
       rng: makeNarrativeRng(userId, turnsSpentTotal, "spell-arm"),
+      heroEmerged: emergedHero,
     });
 
     return {
@@ -1933,9 +2779,17 @@ export async function armDefenseSpellServer(
         ...player,
         turnsRemaining: player.turnsRemaining - cost,
         turnsSpentTotal,
+        heroCount: emergedHero
+          ? (player.heroCount ?? 0) + 1
+          : player.heroCount,
         updatedAt: now,
       },
-      tile: { ...tile, armedDefenseSpellId: spellId, updatedAt: now },
+      tile: {
+        ...tile,
+        armedDefenseSpellId: spellId,
+        hero: emergedHero ?? tile.hero,
+        updatedAt: now,
+      },
       report,
       artifact: rolled?.doc ?? null,
     };
@@ -2098,7 +2952,10 @@ export async function castIntelSpellServer(
     source: "spell",
     sourceId: spell.id,
     capturedAtTurn: txResult.turnsSpentTotal,
-    attackerCaste: spell.caste,
+    // spell.caste is widened to Caste | "neutral" for Armageddon, but intel
+    // spells are caste-bound (validated inside the tx). Read the validated
+    // caste off the returned player so the type narrows to a real Caste.
+    attackerCaste: txResult.player.caste as Caste,
   });
 
   // Black & Green spies are detected by the defender; the alert is now
@@ -2252,15 +3109,144 @@ export async function castProductionSpellServer(
   });
 }
 
+// =====================================================================
+// Heroes — special-unit summoning
+// =====================================================================
+
+/**
+ * Stations a caste-themed special unit (produced by a farm hero's
+ * special-unit roll) onto one of the player's tiles. The unit's
+ * attack/defense bonuses fold into combat math at the stationed tile
+ * (see `computeStationedSpecialUnitBonuses`).
+ *
+ * Free of turn cost — special units are reward content, not actions —
+ * but we still validate ownership of both the instance and the target
+ * tile. Idempotent in the sense that calling with an already-stationed
+ * instance throws GameSpecialUnitAlreadyStationedError; caller must
+ * unsummon before moving.
+ */
+export async function summonSpecialUnitServer(args: {
+  userId: string;
+  instanceId: string;
+  targetTileId: string;
+  now?: Date;
+}): Promise<{ player: GamePlayer; tileId: string }> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.userId);
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(args.targetTileId);
+
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, tileSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(tileRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!tileSnap.exists) throw new GameTileNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const tile = tileSnap.data() as GameTile;
+    if (tile.ownerId !== args.userId) throw new GameTileNotOwnedError();
+    if (player.phase !== "play") {
+      throw new GameInvalidPhaseError("play", player.phase);
+    }
+    const pool = player.summonableSpecialUnits ?? [];
+    const idx = pool.findIndex((u) => u.instanceId === args.instanceId);
+    if (idx === -1) throw new GameSpecialUnitNotFoundError(args.instanceId);
+    const instance = pool[idx];
+    if (instance.stationedTileId) {
+      throw new GameSpecialUnitAlreadyStationedError();
+    }
+    const next = [...pool];
+    next[idx] = { ...instance, stationedTileId: args.targetTileId };
+    tx.update(playerRef, {
+      summonableSpecialUnits: next,
+      updatedAt: now,
+    });
+    return {
+      player: {
+        ...player,
+        summonableSpecialUnits: next,
+        updatedAt: now,
+      },
+      tileId: args.targetTileId,
+    };
+  });
+}
+
+/**
+ * Recalls a stationed special unit back into the player's pool. No turn
+ * cost. Used by the dashboard's SummonableUnitsCard when the player
+ * wants to redeploy a unit elsewhere.
+ */
+export async function unsummonSpecialUnitServer(args: {
+  userId: string;
+  instanceId: string;
+  now?: Date;
+}): Promise<{ player: GamePlayer }> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.userId);
+
+  return db.runTransaction(async (tx) => {
+    const playerSnap = await tx.get(playerRef);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const pool = player.summonableSpecialUnits ?? [];
+    const idx = pool.findIndex((u) => u.instanceId === args.instanceId);
+    if (idx === -1) throw new GameSpecialUnitNotFoundError(args.instanceId);
+    const instance = pool[idx];
+    if (!instance.stationedTileId) {
+      // No-op: already unsummoned.
+      return { player };
+    }
+    const next = [...pool];
+    next[idx] = { ...instance, stationedTileId: undefined };
+    tx.update(playerRef, {
+      summonableSpecialUnits: next,
+      updatedAt: now,
+    });
+    return {
+      player: {
+        ...player,
+        summonableSpecialUnits: next,
+        updatedAt: now,
+      },
+    };
+  });
+}
+
 // Launches an attack. The pure resolveAttack from combat.ts decides the
 // outcome; this function orchestrates the read/write transaction around it
 // and persists the attack-log doc.
+//
+// Heroes (May 2026): when the target tile holds a hero, the attacker may
+// pass `heroAction` to choose what happens on a winning combat:
+//   - "kill"    : capture the tile and discard the hero (default; matches
+//                 legacy behavior for non-hero tiles).
+//   - "spare"   : wear the hero down without taking the tile. Tile stays
+//                 with defender; attacker still pays turn cost + casualties;
+//                 hero stamina drops by SPARE_STAMINA_MULT× a normal
+//                 engagement. Useful to grind the hero below
+//                 STAMINA_CONVERSION_THRESHOLD before a convert attempt.
+//   - "convert" : roll for the hero to defect. Only valid when stamina is
+//                 already at/below STAMINA_CONVERSION_THRESHOLD. On success
+//                 the tile transfers AND the hero changes owner. On failure
+//                 the attacker falls back to `heroActionOnConvertFail`.
 export async function attackTileServer(args: {
   attackerId: string;
   sourceTileId: string;
   targetTileId: string;
   units: UnitStack;
   offenseSpellId: string | null;
+  // Heroes (May 2026). Ignored when the target tile has no hero. Default
+  // is "kill" — preserves legacy semantics for non-hero tiles.
+  heroAction?: HeroBattleAction;
+  // Fallback when heroAction === "convert" and the roll fails. Defaults
+  // to "kill" (legacy semantics: you won, you take the tile).
+  heroActionOnConvertFail?: Exclude<HeroBattleAction, "convert">;
+  // Optional ≤280-char attacker-authored taunt attached to the attack
+  // record. Sanitized server-side. Empty/missing = no dispatch.
+  dispatch?: string;
   now?: Date;
 }): Promise<{
   attack: GameAttack;
@@ -2332,6 +3318,26 @@ export async function attackTileServer(args: {
     defenderTileId: args.targetTileId,
   });
 
+  // Zero-turn gameplay: detect any active pact the attacker is about to
+  // break. The attack still resolves, but with an Oathbreaker penalty on
+  // attackPower AND the attacker gets the public mark for 7 days. The
+  // lookup runs outside the txn (like markPactsBrokenInTx, which we'll
+  // call later to actually stamp brokenAt).
+  const pactsToBreak = await findActivePactsBetween({
+    db,
+    attackerId: args.attackerId,
+    defenderId,
+    now,
+  });
+  const willBreakPact = pactsToBreak.length > 0;
+  // Also detect any already-active oathbreaker mark from a PRIOR breach.
+  const priorOathbreakerPenalty = oathbreakerAttackPenalty(attackerPre, now);
+  // Effective penalty for THIS attack: max of prior mark and breach-now.
+  const oathbreakerPenaltyForThisAttack = Math.max(
+    priorOathbreakerPenalty,
+    willBreakPact ? OATHBREAKER_ATTACK_PENALTY : 0
+  );
+
   if (offenseSpell) {
     // We can't validate caste-match yet without reading the player; deferred
     // into the transaction below.
@@ -2382,6 +3388,12 @@ export async function attackTileServer(args: {
     if (target.ownerId === args.attackerId) throw new GameSelfAttackError();
     if (!source.neighborTileIds.includes(args.targetTileId)) {
       throw new GameNotAdjacentError();
+    }
+    // Zero-turn gameplay: a tile in defensive stance trades its offensive
+    // option for the +25% defense bonus and cannot launch attacks until
+    // the stance lifts (see toggleDefensiveStanceServer).
+    if (isTileInDefensiveStance(source, now)) {
+      throw new GameDefensiveStanceBlockedError();
     }
     if (offenseSpell && offenseSpell.caste !== attacker.caste) {
       throw new GameInvalidSpellError(
@@ -2466,6 +3478,24 @@ export async function attackTileServer(args: {
     // outside txn would race; instead we approximate using 0 for now and
     // require the caller (ourselves) to pass the count via the magicLandCount
     // arg. For the resolve, we'll use 0 to err on the conservative side.
+    // Heroes (May 2026). Pre-resolve the additive attack/defense bonuses
+    // from any military hero stationed on the source/target tile (plus
+    // stationed special-unit contributions folded into the same channel).
+    // Combat math applies (1 + bonus) at the same numeric stage as the
+    // existing intel bonuses; see combat.ts:resolveAttack.
+    const heroAttackBonus = combinedHeroAttackBonus(attacker, source, target, now);
+    const heroDefenseBonus = combinedHeroDefenseBonus(defender, target, source, now);
+    // Zero-turn gameplay: fold defensive-stance and Last Stand into the
+    // defender's combat input. Adjacent-rally penalties (rally pulls
+    // reserves from neighbors) are not applied here — they're picked up
+    // by attacks against THOSE neighbors which read this tile's
+    // activeLastStand. For the target tile itself the bonus is purely
+    // additive.
+    const zeroTurnDefenseBonus = computeZeroTurnDefenseBonus({
+      tile: target,
+      now,
+    });
+
     const result = resolveAttack(
       {
         caste: attacker.caste,
@@ -2477,6 +3507,8 @@ export async function attackTileServer(args: {
         intelOffenseBonus: intelContext.forgeSightOffenseBonus,
         sourceLandType: source.type,
         preCastOffenseBonus: intelContext.preCastOffenseBonus,
+        heroAttackBonus,
+        oathbreakerPenalty: oathbreakerPenaltyForThisAttack,
       },
       {
         caste: defender.caste,
@@ -2488,6 +3520,8 @@ export async function attackTileServer(args: {
         activeUpgrades: defenderActiveUpgrades,
         intelDefenseBonus: intelContext.alertVsCasterDefenseBonus,
         defenseDisarmFraction: intelContext.defenseDisarmFraction,
+        heroDefenseBonus,
+        zeroTurnDefenseBonus,
       },
       {
         capacity: tileCapacity,
@@ -2549,7 +3583,62 @@ export async function attackTileServer(args: {
     let updatedTargetUpgrades: string[] = target.upgradeIds;
     let captured = false;
 
-    if (result.outcome === "captured") {
+    // ── Hero action resolution (May 2026 Heroes feature) ─────────────────
+    //
+    // When the target tile has a hero and the combat outcome is "captured",
+    // the attacker chooses: kill (legacy), spare (don't take tile), or
+    // convert (defect roll). For "convert", we roll inside the txn; on
+    // failure we fall back to heroActionOnConvertFail. The outcome decides
+    // whether `captured` stays true.
+    const targetHeroPreEngagement = target.hero ?? null;
+    let heroAction: HeroBattleAction =
+      targetHeroPreEngagement && result.outcome === "captured"
+        ? args.heroAction ?? "kill"
+        : "kill";
+    // Apply lazy stamina regen to the defender's hero BEFORE engagement so
+    // the conversion-threshold check uses the up-to-date value.
+    const targetHeroRegened = targetHeroPreEngagement
+      ? applyStaminaRegen(targetHeroPreEngagement, defender.turnsSpentTotal)
+      : null;
+    if (
+      heroAction === "convert" &&
+      targetHeroRegened &&
+      targetHeroRegened.stamina > STAMINA_CONVERSION_THRESHOLD
+    ) {
+      throw new GameInvalidSpellError(
+        `convert requires hero stamina ≤ ${STAMINA_CONVERSION_THRESHOLD} (current ${targetHeroRegened.stamina})`
+      );
+    }
+    let convertSucceeded = false;
+    if (heroAction === "convert" && targetHeroRegened) {
+      const convertRng = makeSeededRng(`hero-convert-${attackId}`);
+      const chance = conversionSuccessChance(targetHeroRegened);
+      convertSucceeded = convertRng() < Math.min(CONVERSION_SUCCESS_CEILING, chance);
+      if (!convertSucceeded) {
+        // Fall back to the attacker's pre-declared backup choice. If they
+        // didn't declare one, default to "kill" (legacy behavior).
+        heroAction = args.heroActionOnConvertFail ?? "kill";
+      }
+    }
+
+    // Engagement always burns hero stamina (won, lost, or stalemate — the
+    // hero fought). Decrement target hero first; source hero gets decremented
+    // below once we know whether it's about to move on capture.
+    let nextTargetHero: GameHero | null = targetHeroRegened
+      ? applyEngagement(
+          targetHeroRegened,
+          defender.turnsSpentTotal,
+          heroAction === "spare" ? SPARE_STAMINA_MULT : 1
+        )
+      : null;
+
+    // Spare ⇒ override the capture outcome: combat was won, but the attacker
+    // chose to wear the hero down instead of taking the tile. Defender keeps
+    // ownership; defender keeps post-curve base+super.
+    const effectiveCaptured =
+      result.outcome === "captured" && heroAction !== "spare";
+
+    if (effectiveCaptured) {
       captured = true;
       // Source: sent units are gone (no return on capture).
       updatedSourceUnits = sourceUnitsAfterDispatch;
@@ -2585,16 +3674,139 @@ export async function attackTileServer(args: {
     );
     const artifact = rolled?.definition ?? null;
 
-    tx.update(sourceRef, {
+    // ── Hero post-resolution mutation ──────────────────────────────────
+    //
+    // Compute final source.hero and target.hero state given the chosen
+    // hero action and whether a military hero on the source moves on
+    // capture. Tracks counter deltas for attacker/defender heroCount so
+    // the denormalized stat stays accurate.
+    const sourceHeroRegened = source.hero
+      ? applyStaminaRegen(source.hero, attacker.turnsSpentTotal)
+      : null;
+    // Source hero (if any) is always engaged when the attack proceeded.
+    const sourceHeroEngaged = sourceHeroRegened
+      ? applyEngagement(sourceHeroRegened, attackerTurnsSpentTotal, 1)
+      : null;
+
+    let nextSourceHero: GameHero | null = sourceHeroEngaged;
+    let attackerHeroDelta = 0;
+    let defenderHeroDelta = 0;
+    let heroSlain: GameHero | null = null;
+    let heroDefected: GameHero | null = null;
+
+    if (captured) {
+      // Defender lost the tile. Decide what happens to whatever hero was
+      // on it before this attack: kill / convert success.
+      if (heroAction === "convert" && convertSucceeded && nextTargetHero) {
+        // Hero defects to the attacker. Stays on the tile (which has
+        // changed owner). Refresh stamina partway so the attacker can use
+        // them, but not at full.
+        heroDefected = nextTargetHero;
+        nextTargetHero = {
+          ...nextTargetHero,
+          ownerId: args.attackerId,
+          tileId: target.tileId,
+          stamina: POST_CONVERT_STAMINA,
+          lastEngagedAtTurn: attackerTurnsSpentTotal,
+        };
+        attackerHeroDelta += 1;
+        defenderHeroDelta -= 1;
+      } else if (nextTargetHero) {
+        // Kill outcome — discard the defender's hero.
+        heroSlain = nextTargetHero;
+        nextTargetHero = null;
+        defenderHeroDelta -= 1;
+      }
+      // Military hero on source moves to the captured tile. If both a
+      // defending hero converted AND an attacking hero is moving in, the
+      // converted hero wins the tile slot (one hero per tile). The moving
+      // hero is then left at the source — pragmatic choice: source-tile
+      // military hero MOVES only when the target slot is empty.
+      if (
+        nextSourceHero &&
+        nextSourceHero.class === "military" &&
+        nextTargetHero == null
+      ) {
+        nextTargetHero = {
+          ...nextSourceHero,
+          tileId: target.tileId,
+          lastEngagedAtTurn: attackerTurnsSpentTotal,
+        };
+        nextSourceHero = null;
+      }
+    }
+    // For spare / repel / stalemate, nextTargetHero stays where it is
+    // (already engagement-decremented above).
+
+    // ── Hero emergence on win ──────────────────────────────────────────
+    //
+    // Military hero may emerge from a won battle. Only fires when the
+    // relevant tile doesn't already have a hero (post-resolution).
+    // Attacker side: capture + target tile is now empty of hero.
+    // Defender side: outcome === "repelled" (true defense win) + target
+    // tile still has no hero. Stalemates do not emerge.
+    let attackerEmergedHero: GameHero | null = null;
+    let defenderEmergedHero: GameHero | null = null;
+    if (captured && nextTargetHero == null && attacker.caste) {
+      const emergeRng = makeSeededRng(
+        `hero-emerge-attack-${args.attackerId}-${attackId}`
+      );
+      attackerEmergedHero = maybeEmergeHero({
+        class: "military",
+        tile: { tileId: target.tileId, hero: undefined },
+        ownerId: args.attackerId,
+        ownerCaste: attacker.caste,
+        turnIndex: attackerTurnsSpentTotal,
+        rng: emergeRng,
+      });
+      if (attackerEmergedHero) {
+        nextTargetHero = attackerEmergedHero;
+        attackerHeroDelta += 1;
+      }
+    }
+    if (
+      !captured &&
+      result.outcome === "repelled" &&
+      nextTargetHero == null &&
+      defender.caste
+    ) {
+      const emergeRng = makeSeededRng(
+        `hero-emerge-defense-${defenderId}-${attackId}`
+      );
+      defenderEmergedHero = maybeEmergeHero({
+        class: "military",
+        tile: { tileId: target.tileId, hero: undefined },
+        ownerId: defenderId,
+        ownerCaste: defender.caste,
+        turnIndex: defender.turnsSpentTotal,
+        rng: emergeRng,
+      });
+      if (defenderEmergedHero) {
+        nextTargetHero = defenderEmergedHero;
+        defenderHeroDelta += 1;
+      }
+    }
+
+    // ── Stage tile writes ──────────────────────────────────────────────
+    //
+    // Hero fields use undefined to omit (Firestore preserves on update);
+    // when a hero is removed we pass `null` so the doc explicitly clears.
+    const sourceWrite: Record<string, unknown> = {
       units: updatedSourceUnits,
       baseUnits: updatedSourceBase,
       updatedAt: now,
-    });
-    tx.update(targetRef, {
+    };
+    if (sourceHeroRegened && nextSourceHero == null) {
+      // Source hero moved away or was otherwise removed.
+      sourceWrite.hero = null;
+    } else if (nextSourceHero && nextSourceHero !== source.hero) {
+      sourceWrite.hero = nextSourceHero;
+    }
+    tx.update(sourceRef, sourceWrite);
+
+    const targetWrite: Record<string, unknown> = {
       units: updatedTargetUnits,
       baseUnits: updatedTargetBase,
-      // On capture, baseRegenedAt resets so the new owner's caste regens
-      // the residual militia from now.
       baseRegenedAt: captured ? now : (target.baseRegenedAt ?? now),
       ownerId: updatedTargetOwner,
       type: updatedTargetType,
@@ -2603,28 +3815,117 @@ export async function attackTileServer(args: {
       armedDefenseSpellId: null,
       lastAttackedAt: now,
       updatedAt: now,
-    });
+    };
+    if (nextTargetHero) {
+      targetWrite.hero = nextTargetHero;
+    } else if (target.hero) {
+      // Tile had a hero before; explicitly clear it (kill OR moved away).
+      targetWrite.hero = null;
+    }
+    // Zero-turn gameplay: Last Stand is single-use — consume on any inbound
+    // attack, whether or not it was active at resolution time (clears the
+    // window so the player has to declare again). Defensive stance clears
+    // on capture (new owner doesn't inherit) and is preserved on repel.
+    if (target.activeLastStand) {
+      targetWrite.activeLastStand = null;
+    }
+    if (captured && target.defensiveStance) {
+      targetWrite.defensiveStance = null;
+    }
+    tx.update(targetRef, targetWrite);
+
+    // ── Stationed special-unit cleanup on tile capture ───────────────────
+    //
+    // Stationed special units on a captured tile vaporize (v1 design).
+    // Filter the defender's pool and persist if any were removed.
+    let nextDefenderSummonable: SpecialUnitInstance[] | undefined =
+      defender.summonableSpecialUnits;
+    if (captured && defender.summonableSpecialUnits) {
+      const before = defender.summonableSpecialUnits;
+      const after = before.filter(
+        (u) => u.stationedTileId !== target.tileId
+      );
+      if (after.length !== before.length) {
+        nextDefenderSummonable = after;
+      }
+    }
 
     const attackerStats = {
       ...attacker.stats,
       unitsAlive: Math.max(0, attacker.stats.unitsAlive - attackerSuperLostTotal),
-      attacksWon: attacker.stats.attacksWon + (captured ? 1 : 0),
+      // "spare" still counts as a win for the attacker (they did win the
+      // fight) but doesn't change tilesHeld.
+      attacksWon:
+        attacker.stats.attacksWon +
+        (result.outcome === "captured" ? 1 : 0),
       tilesHeld: attacker.stats.tilesHeld + (captured ? 1 : 0),
     };
     const defenderStats = {
       ...defender.stats,
       unitsAlive: Math.max(0, defender.stats.unitsAlive - defenderSuperLostTotal),
-      attacksLost: defender.stats.attacksLost + (captured ? 1 : 0),
+      // Mirror: any "captured" combat result is a loss for the defender,
+      // even if the attacker chose to spare the tile.
+      attacksLost:
+        defender.stats.attacksLost +
+        (result.outcome === "captured" ? 1 : 0),
       tilesHeld: Math.max(0, defender.stats.tilesHeld - (captured ? 1 : 0)),
     };
 
-    tx.update(attackerRef, {
+    const attackerUpdate: Record<string, unknown> = {
       turnsRemaining: attacker.turnsRemaining - turnCost,
       turnsSpentTotal: attacker.turnsSpentTotal + turnCost,
       stats: attackerStats,
       updatedAt: now,
-    });
-    tx.update(defenderRef, { stats: defenderStats, updatedAt: now });
+    };
+    if (attackerHeroDelta !== 0) {
+      attackerUpdate.heroCount = Math.max(
+        0,
+        (attacker.heroCount ?? 0) + attackerHeroDelta
+      );
+    }
+    // Zero-turn gameplay: stamp the Oathbreaker mark when this attack
+    // breaks one or more active pacts. The penalty already applied to
+    // attackPower above; this write makes the mark visible on the public
+    // profile + applies to subsequent attacks within the window. Use the
+    // larger of any existing oathbreakerUntil and the new expiry so a
+    // fresh breach during an existing window extends the punishment.
+    if (willBreakPact) {
+      const oathbreakerUntil = new Date(
+        Math.max(
+          attacker.oathbreakerUntil instanceof Date
+            ? attacker.oathbreakerUntil.getTime()
+            : 0,
+          now.getTime() + OATHBREAKER_DURATION_MS
+        )
+      );
+      attackerUpdate.oathbreakerUntil = oathbreakerUntil;
+      attackerUpdate.oathbreakerLastPactId = pactsToBreak[0].id;
+    }
+    tx.update(attackerRef, attackerUpdate);
+
+    const defenderUpdate: Record<string, unknown> = {
+      stats: defenderStats,
+      updatedAt: now,
+    };
+    if (defenderHeroDelta !== 0) {
+      defenderUpdate.heroCount = Math.max(
+        0,
+        (defender.heroCount ?? 0) + defenderHeroDelta
+      );
+    }
+    if (nextDefenderSummonable !== defender.summonableSpecialUnits) {
+      defenderUpdate.summonableSpecialUnits = nextDefenderSummonable;
+    }
+    // Zero-turn gameplay: if the captured tile was in defensive stance,
+    // decrement the defender's denormalized counter so the cap check
+    // stays accurate.
+    if (captured && isTileInDefensiveStance(target, now)) {
+      defenderUpdate.activeDefensiveStanceCount = Math.max(
+        0,
+        (defender.activeDefensiveStanceCount ?? 0) - 1
+      );
+    }
+    tx.update(defenderRef, defenderUpdate);
 
     // Community feed: announce the attack and any 1k-tile milestone
     // crossed by the attacker as a result of this capture.
@@ -2643,6 +3944,21 @@ export async function attackTileServer(args: {
       },
       now
     );
+
+    // Phase 7: if the attacker has an active pact targeting this
+    // defender, stamp it broken + post a `pact_broken` feed event.
+    // The lookup runs outside any txn read, so this comes after all
+    // other tx.get() calls on the attack path.
+    await markPactsBrokenInTx({
+      tx,
+      db,
+      attackerId: args.attackerId,
+      attackerDisplayName: attacker.displayName,
+      attackerCaste: attacker.caste,
+      defenderId,
+      defenderDisplayName: defender.displayName,
+      now,
+    });
     if (
       attacker.stats.tilesHeld < 1000 &&
       attackerStats.tilesHeld >= 1000
@@ -2660,6 +3976,257 @@ export async function attackTileServer(args: {
       );
     }
 
+    // Hero community events.
+    const heroEmergedForFeed = attackerEmergedHero ?? defenderEmergedHero;
+    if (heroEmergedForFeed) {
+      const actor = attackerEmergedHero ? attacker : defender;
+      const actorIdForFeed = attackerEmergedHero
+        ? args.attackerId
+        : defenderId;
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "hero_emerged",
+          actorUserId: actorIdForFeed,
+          actorDisplayName: actor.displayName,
+          actorCaste: actor.caste,
+          tileId: target.tileId,
+          heroId: heroEmergedForFeed.id,
+          heroName: heroEmergedForFeed.name,
+          heroClass: heroEmergedForFeed.class,
+          heroSpecialty: heroEmergedForFeed.specialty,
+        },
+        now
+      );
+    }
+    if (heroDefected) {
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "hero_defected",
+          actorUserId: args.attackerId,
+          actorDisplayName: attacker.displayName,
+          actorCaste: attacker.caste,
+          tileId: target.tileId,
+          heroId: heroDefected.id,
+          heroName: heroDefected.name,
+          heroClass: heroDefected.class,
+          heroSpecialty: heroDefected.specialty,
+          otherUserId: defenderId,
+          otherDisplayName: defender.displayName,
+          otherCaste: defender.caste,
+        },
+        now
+      );
+    }
+    if (heroSlain) {
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "hero_slain",
+          actorUserId: defenderId,
+          actorDisplayName: defender.displayName,
+          actorCaste: defender.caste,
+          tileId: target.tileId,
+          heroId: heroSlain.id,
+          heroName: heroSlain.name,
+          heroClass: heroSlain.class,
+          heroSpecialty: heroSlain.specialty,
+          otherUserId: args.attackerId,
+          otherDisplayName: attacker.displayName,
+          otherCaste: attacker.caste,
+        },
+        now
+      );
+    }
+
+    // ── v2 hero registry dual-writes ─────────────────────────────────
+    //
+    // Mirror every hero state change into the persistent collection so
+    // history survives the death of the inline `tile.hero` snapshot.
+    // Ordering matters slightly: emergence writes (which create the doc)
+    // before event writes (which require the doc to exist). The order
+    // below also matches the chronological "what happened" sequence so
+    // the events subcollection reads naturally.
+    const attackerSeasonNumber = attacker.seasonNumber ?? 1;
+    const defenderSeasonNumber = defender.seasonNumber ?? 1;
+
+    // 1. Engagement events for any hero present pre-attack. The source
+    //    hero engages when the attack proceeds (deployed > 0, which is
+    //    guaranteed here since we're past the early-return). The target
+    //    hero engages when its tile was attacked.
+    if (sourceHeroRegened) {
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: sourceHeroRegened.id,
+        event: heroEvent.engagedAttacker({
+          tileId: args.sourceTileId,
+          ownerIdAtTime: args.attackerId,
+          defenderId,
+          targetTileId: args.targetTileId,
+          outcome: result.outcome,
+          seasonNumber: attackerSeasonNumber,
+        }),
+        now,
+      });
+    }
+    if (targetHeroPreEngagement) {
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: targetHeroPreEngagement.id,
+        event: heroEvent.engagedDefender({
+          tileId: target.tileId,
+          ownerIdAtTime: defenderId,
+          attackerId: args.attackerId,
+          outcome: result.outcome,
+          seasonNumber: defenderSeasonNumber,
+        }),
+        now,
+      });
+    }
+
+    // 2. Resolution events: slain, defected, moved on capture.
+    if (heroSlain) {
+      markHeroDeceasedInTx({
+        tx,
+        db,
+        heroId: heroSlain.id,
+        deceasedTileId: target.tileId,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: heroSlain.id,
+        event: heroEvent.slain({
+          tileId: target.tileId,
+          ownerIdAtTime: defenderId,
+          attackerId: args.attackerId,
+          seasonNumber: defenderSeasonNumber,
+        }),
+        now,
+      });
+    }
+    if (heroDefected && nextTargetHero) {
+      transferHeroOwnerInTx({
+        tx,
+        db,
+        heroId: heroDefected.id,
+        newOwnerId: args.attackerId,
+        newTileId: target.tileId,
+        newStamina: nextTargetHero.stamina,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: heroDefected.id,
+        event: heroEvent.defected({
+          tileId: target.tileId,
+          fromOwnerId: defenderId,
+          toOwnerId: args.attackerId,
+          seasonNumber: defenderSeasonNumber,
+        }),
+        now,
+      });
+    }
+    // Military hero moved on capture: source.hero was cleared and the
+    // hero now occupies the captured tile under the attacker.
+    const heroMovedOnCapture =
+      captured &&
+      nextTargetHero != null &&
+      sourceHeroRegened != null &&
+      nextSourceHero == null &&
+      sourceHeroRegened.id === nextTargetHero.id;
+    if (heroMovedOnCapture && nextTargetHero) {
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: nextTargetHero,
+        seasonNumber: attackerSeasonNumber,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: nextTargetHero.id,
+        event: heroEvent.movedOnCapture({
+          tileId: target.tileId,
+          fromTileId: args.sourceTileId,
+          ownerIdAtTime: args.attackerId,
+          seasonNumber: attackerSeasonNumber,
+        }),
+        now,
+      });
+    } else if (sourceHeroRegened && nextSourceHero) {
+      // Source hero stayed but had stamina decremented — refresh registry.
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: nextSourceHero,
+        seasonNumber: attackerSeasonNumber,
+        now,
+      });
+    }
+    // Target hero stayed (spare or repel) — refresh registry stamina.
+    if (
+      targetHeroPreEngagement &&
+      nextTargetHero &&
+      !heroMovedOnCapture &&
+      !heroDefected
+    ) {
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: nextTargetHero,
+        seasonNumber: defenderSeasonNumber,
+        now,
+      });
+    }
+
+    // 3. Fresh emergences (military). Either an attacker emergence on
+    //    capture OR a defender emergence on repel.
+    if (attackerEmergedHero) {
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: attackerEmergedHero,
+        seasonNumber: attackerSeasonNumber,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: attackerEmergedHero.id,
+        event: heroEvent.emerged(attackerEmergedHero, attackerSeasonNumber),
+        now,
+      });
+    }
+    if (defenderEmergedHero) {
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: defenderEmergedHero,
+        seasonNumber: defenderSeasonNumber,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: defenderEmergedHero.id,
+        event: heroEvent.emerged(defenderEmergedHero, defenderSeasonNumber),
+        now,
+      });
+    }
+
+    const dispatch = args.dispatch
+      ? sanitizeText(args.dispatch).slice(0, 280)
+      : "";
     const attack: GameAttack = {
       id: attackId,
       attackerId: args.attackerId,
@@ -2676,7 +4243,15 @@ export async function attackTileServer(args: {
       rngSeed: `attack-${attackId}`,
       outcome: result.outcome,
       turnsCost: turnCost,
+      // Zero-turn gameplay: pre-attack defender composition snapshot for
+      // the Battle Autopsy feature. Surfaced on /game/attacks/[attackId]
+      // so the loser can run counterfactual "what would have flipped this"
+      // simulations. The composite is BASE+SUPER; baseUnitsOnTargetPreAttack
+      // splits the BASE portion for finer attribution.
+      unitsOnTargetPreAttack: defenderComposite,
+      baseUnitsOnTargetPreAttack: targetBase,
       createdAt: now,
+      ...(dispatch ? { dispatch } : {}),
     };
     tx.set(attackRef, attack);
 
@@ -2688,6 +4263,27 @@ export async function attackTileServer(args: {
       combat: result,
       artifactFound: artifact,
       rng: makeNarrativeRng(args.attackerId, attackerTurnsSpentTotal, "attack"),
+      heroEmerged: heroEmergedForFeed,
+      heroAction:
+        targetHeroPreEngagement && result.outcome === "captured"
+          ? heroAction
+          : null,
+      heroDefected: heroDefected
+        ? {
+            id: heroDefected.id,
+            name: heroDefected.name,
+            class: heroDefected.class,
+            specialty: heroDefected.specialty,
+          }
+        : null,
+      heroSlain: heroSlain
+        ? {
+            id: heroSlain.id,
+            name: heroSlain.name,
+            class: heroSlain.class,
+            specialty: heroSlain.specialty,
+          }
+        : null,
     });
 
     return {
@@ -2697,13 +4293,21 @@ export async function attackTileServer(args: {
         turnsRemaining: attacker.turnsRemaining - turnCost,
         turnsSpentTotal: attackerTurnsSpentTotal,
         stats: attackerStats,
+        heroCount: Math.max(0, (attacker.heroCount ?? 0) + attackerHeroDelta),
         updatedAt: now,
       },
-      defenderPlayer: { ...defender, stats: defenderStats, updatedAt: now },
+      defenderPlayer: {
+        ...defender,
+        stats: defenderStats,
+        heroCount: Math.max(0, (defender.heroCount ?? 0) + defenderHeroDelta),
+        summonableSpecialUnits: nextDefenderSummonable,
+        updatedAt: now,
+      },
       sourceTile: {
         ...source,
         units: updatedSourceUnits,
         baseUnits: updatedSourceBase,
+        hero: nextSourceHero ?? undefined,
         updatedAt: now,
       },
       targetTile: {
@@ -2717,6 +4321,7 @@ export async function attackTileServer(args: {
         upgradeIds: updatedTargetUpgrades,
         armedDefenseSpellId: null,
         lastAttackedAt: now,
+        hero: nextTargetHero ?? undefined,
         updatedAt: now,
       },
       report,
@@ -3528,14 +5133,23 @@ export async function castSpellServer(args: {
     const castId = randomUUID();
     const rng = makeSeededRng(`cast-${castId}`);
     const dice = rollSpellEffectiveness(rng);
-    const rawMagnitude = realizedSpellMagnitude({
-      baseStrength: spell.baseStrength,
-      caste: attacker.caste,
-      spellType: spell.type,
-      magicLandCount: attackerLandCounts.magic,
-      activeUpgrades: attacker.activeUpgrades ?? {},
-      dice,
-    });
+    // Magic-hero spell boost: if a magic hero is stationed on the source
+    // tile, multiply realized magnitude by a stamina+specialty-weighted
+    // factor. Stacks on top of the existing magicMultiplier / caste bonus.
+    const magicHeroSpellMult = magicHeroSpellMultiplier(
+      attacker.turnsSpentTotal,
+      source,
+      spell
+    );
+    const rawMagnitude =
+      realizedSpellMagnitude({
+        baseStrength: spell.baseStrength,
+        caste: attacker.caste,
+        spellType: spell.type,
+        magicLandCount: attackerLandCounts.magic,
+        activeUpgrades: attacker.activeUpgrades ?? {},
+        dice,
+      }) * magicHeroSpellMult;
 
     const turnsSpentTotal = attacker.turnsSpentTotal + spell.turnCost;
     let kindPayload: {
@@ -3615,11 +5229,90 @@ export async function castSpellServer(args: {
       };
     }
 
-    tx.update(attackerRef, {
+    // Magic hero emergence (source tile must be magic + heroless +
+    // attacker has a caste). Persists on the source tile and bumps the
+    // attacker's heroCount.
+    let emergedHero: GameHero | null = null;
+    if (source.type === "magic" && source.hero == null && attacker.caste) {
+      const emergeRng = makeSeededRng(
+        `hero-emerge-cast-${args.attackerId}-${turnsSpentTotal}`
+      );
+      emergedHero = maybeEmergeHero({
+        class: "magic",
+        tile: source,
+        ownerId: args.attackerId,
+        ownerCaste: attacker.caste,
+        turnIndex: turnsSpentTotal,
+        rng: emergeRng,
+      });
+      if (emergedHero) {
+        tx.update(sourceRef, { hero: emergedHero, updatedAt: now });
+        logCommunityEventInTx(
+          tx,
+          db,
+          {
+            kind: "hero_emerged",
+            actorUserId: args.attackerId,
+            actorDisplayName: attacker.displayName,
+            actorCaste: attacker.caste,
+            tileId: args.sourceTileId,
+            heroId: emergedHero.id,
+            heroName: emergedHero.name,
+            heroClass: emergedHero.class,
+            heroSpecialty: emergedHero.specialty,
+          },
+          now
+        );
+      }
+    }
+
+    // v2 registry: emergence + spell_cast event for the source magic hero
+    // (either the freshly emerged one OR a pre-existing one).
+    const castSeasonNumber = attacker.seasonNumber ?? 1;
+    const magicHeroOnSource =
+      emergedHero ??
+      (source.hero && source.hero.class === "magic" ? source.hero : null);
+    if (emergedHero) {
+      upsertHeroInTx({
+        tx,
+        db,
+        hero: emergedHero,
+        seasonNumber: castSeasonNumber,
+        now,
+      });
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: emergedHero.id,
+        event: heroEvent.emerged(emergedHero, castSeasonNumber),
+        now,
+      });
+    }
+    if (magicHeroOnSource) {
+      appendHeroEventInTx({
+        tx,
+        db,
+        heroId: magicHeroOnSource.id,
+        event: heroEvent.spellCast({
+          tileId: args.sourceTileId,
+          ownerIdAtTime: args.attackerId,
+          spellId: spell.id,
+          targetTileId: args.targetTileId,
+          seasonNumber: castSeasonNumber,
+        }),
+        now,
+      });
+    }
+
+    const attackerUpdate: Record<string, unknown> = {
       turnsRemaining: attacker.turnsRemaining - spell.turnCost,
       turnsSpentTotal,
       updatedAt: now,
-    });
+    };
+    if (emergedHero) {
+      attackerUpdate.heroCount = (attacker.heroCount ?? 0) + 1;
+    }
+    tx.update(attackerRef, attackerUpdate);
 
     // Re-narrow spell.type for buildCastSpellReport — the TS flow analysis
     // doesn't see through the early throw when traversing through the
@@ -3639,12 +5332,14 @@ export async function castSpellServer(args: {
         ? { unitsKilled: kindPayload.attrition.unitsKilled }
         : undefined,
       rng: makeNarrativeRng(args.attackerId, turnsSpentTotal, "spell-cast"),
+      heroEmerged: emergedHero,
     });
 
     const updatedPlayer: GamePlayer = {
       ...attacker,
       turnsRemaining: attacker.turnsRemaining - spell.turnCost,
       turnsSpentTotal,
+      heroCount: emergedHero ? (attacker.heroCount ?? 0) + 1 : attacker.heroCount,
       updatedAt: now,
     };
 
@@ -3840,6 +5535,8 @@ export async function runWeeklyRolloverServer(
         const updated = applyWeeklyGrant(freshData, wkStart, now);
         tx.update(playerRef, {
           turnsRemaining: updated.turnsRemaining,
+          // Zero-turn gameplay: consume any pending prophecy bonus on grant.
+          pendingProphecyBonus: 0,
           lastWeeklyGrantAt: updated.lastWeeklyGrantAt,
           lastWeeklyGrantWeekStart: updated.lastWeeklyGrantWeekStart,
           updatedAt: updated.updatedAt,
@@ -3848,6 +5545,20 @@ export async function runWeeklyRolloverServer(
       });
       if (granted) summary.granted += 1;
       else summary.skippedAlreadyGranted += 1;
+
+      // Zero-turn gameplay: execute queued orders for this player AFTER
+      // their grant lands. Skip when not granted (no turns to spend).
+      if (granted) {
+        try {
+          await executeQueuedOrdersForPlayer(db, player.userId, now);
+        } catch (queueErr) {
+          const m = queueErr instanceof Error ? queueErr.message : String(queueErr);
+          logger.warn("Queued-orders execution error", {
+            userId: player.userId,
+            error: m,
+          });
+        }
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       summary.errors.push({ userId: player.userId, error: message });
@@ -3925,6 +5636,94 @@ export async function setGeneralNameServer(
   });
 }
 
+const MAX_BIO_LENGTH = 500;
+const MAX_INSCRIPTION_LENGTH = 120;
+
+/**
+ * Sets the owner-authored inscription on a tile. Cosmetic — surfaces
+ * via intel scans / attack outcomes. Owner-only write. Empty string
+ * clears the inscription.
+ */
+export async function setTileInscriptionServer(
+  userId: string,
+  tileId: string,
+  rawInscription: string,
+  now: Date = new Date()
+): Promise<GameTile> {
+  const cleaned = sanitizeText(rawInscription);
+  if (cleaned.length > MAX_INSCRIPTION_LENGTH) {
+    throw new GameInscriptionTooLongError();
+  }
+  const db = adminDbOrThrow();
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(tileId);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(tileRef);
+    if (!snap.exists) throw new GameTileNotFoundError();
+    const tile = snap.data() as GameTile;
+    if (tile.ownerId !== userId) throw new GameTileNotOwnedError();
+    tx.update(tileRef, {
+      inscription: cleaned,
+      inscriptionUpdatedAt: now,
+      updatedAt: now,
+    });
+    return {
+      ...tile,
+      inscription: cleaned,
+      inscriptionUpdatedAt: now,
+      updatedAt: now,
+    };
+  });
+}
+
+/**
+ * Updates the player's free-form public bio shown on the profile page.
+ * No turn cost; rate-limited at the route layer. Passing an empty
+ * string clears the bio. Sanitizes via sanitizeText() before write so
+ * control chars / stray tabs don't leak into Firestore.
+ */
+export async function setPlayerBioServer(
+  userId: string,
+  rawBio: string,
+  now: Date = new Date()
+): Promise<GamePlayer> {
+  const cleaned = sanitizeText(rawBio);
+  if (cleaned.length > MAX_BIO_LENGTH) {
+    throw new GamePlayerBioTooLongError();
+  }
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(userId);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(playerRef);
+    if (!snap.exists) throw new GamePlayerNotFoundError();
+    tx.update(playerRef, {
+      bio: cleaned,
+      bioUpdatedAt: now,
+      updatedAt: now,
+    });
+    return {
+      ...(snap.data() as GamePlayer),
+      bio: cleaned,
+      bioUpdatedAt: now,
+      updatedAt: now,
+    };
+  });
+}
+
+/**
+ * Public read for /game/players/[playerId]. Returns the player doc as-
+ * is — the page renders only the public-safe fields, and `game_players`
+ * is already world-readable for the leaderboard, so there's no extra
+ * secret to filter out. Returns null if the player doesn't exist.
+ */
+export async function getPublicPlayerProfileServer(
+  userId: string
+): Promise<GamePlayer | null> {
+  const db = adminDbOrThrow();
+  const snap = await db.collection(COLLECTIONS.PLAYERS).doc(userId).get();
+  if (!snap.exists) return null;
+  return snap.data() as GamePlayer;
+}
+
 export async function getLeaderboardServer(opts: {
   limit: number;
   cursor: string | null;
@@ -3986,6 +5785,8 @@ export async function adminGrantTurnsServer(
     const granted = applyWeeklyGrant(player, wkStart, now);
     tx.update(playerRef, {
       turnsRemaining: granted.turnsRemaining,
+      // Zero-turn gameplay: consume any pending prophecy bonus on grant.
+      pendingProphecyBonus: 0,
       lastWeeklyGrantAt: granted.lastWeeklyGrantAt,
       lastWeeklyGrantWeekStart: granted.lastWeeklyGrantWeekStart,
       updatedAt: granted.updatedAt,
@@ -5252,5 +7053,752 @@ export async function removeUpgradeServer(args: {
         updatedAt: now,
       },
     };
+  });
+}
+
+// =====================================================================
+// End-game / Armageddon
+// =====================================================================
+
+/**
+ * Casts the universal end-game Armageddon spell. Costs ARMAGEDDON_TURN_COST
+ * turns regardless of outcome (the spell is a deliberate gamble). On a
+ * successful roll, breaks one of the 7 global Seals; when the 7th breaks,
+ * the worldMeta state flips to "resolving" and the caller should fire the
+ * resolveArmageddon orchestrator outside this transaction.
+ *
+ * Concurrency: two casts racing on seal #7 serialize on the worldMeta
+ * singleton — Firestore aborts and retries the loser, which then re-reads
+ * sealsBroken === SEAL_COUNT and short-circuits with GameSealsExhaustedError.
+ * The losing player's turns were already deducted by their own retry; this
+ * is by design — the spell is high-risk by construction.
+ */
+export async function castArmageddonServer(args: {
+  userId: string;
+  now?: Date;
+}): Promise<{
+  success: boolean;
+  successChance: number;
+  sealsBroken: number;       // after this cast
+  seasonNumber: number;
+  player: GamePlayer;
+  shouldTriggerResolve: boolean;
+}> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.userId);
+
+  // Pre-tx land-count read (mirrors castSpellServer). Magic-land count is
+  // the primary input to the success formula; a few ms of staleness is fine.
+  // Pull heroes from the same query so magic-hero virtual lands fold in.
+  const armaSummary = await getOwnedTileSummary(args.userId);
+  const landCounts = armaSummary.counts;
+
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, worldMetaResult] = await Promise.all([
+      tx.get(playerRef),
+      readWorldMetaInTx(tx, db),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const worldMeta = worldMetaResult.meta;
+
+    assertGameActiveInTx(player, worldMeta);
+
+    if (player.phase !== "play") {
+      throw new GameInvalidPhaseError("play", player.phase);
+    }
+    if (player.caste === null) {
+      throw new GameInvalidPhaseError("play (caste required)", player.phase);
+    }
+    if (player.stats.tilesHeld < ARMAGEDDON_TILE_GATE) {
+      throw new GameInvalidSpellError(
+        `Armageddon requires ${ARMAGEDDON_TILE_GATE} tiles held; you have ${player.stats.tilesHeld}`
+      );
+    }
+    if (player.turnsRemaining < ARMAGEDDON_TURN_COST) {
+      throw new GameInsufficientTurnsError(
+        ARMAGEDDON_TURN_COST,
+        player.turnsRemaining
+      );
+    }
+    const sealsBrokenBefore = worldMeta.sealsBroken ?? 0;
+    if (sealsBrokenBefore >= SEAL_COUNT) {
+      throw new GameSealsExhaustedError();
+    }
+
+    // Success roll. Seed includes a fresh cast id so replays are independent
+    // and no two casts share a deterministic outcome.
+    const castId = randomUUID();
+    const rng = makeSeededRng(`armageddon-${castId}`);
+    // Magic-hero contribution (May 2026 Heroes feature): each magic hero
+    // counts as MAGIC_HERO_VIRTUAL_LANDS magic lands (stamina-scaled; the
+    // "armageddon" specialty doubles). Fed straight into magicMultiplier
+    // alongside real magic-land count. Reuses the existing soft-cap curve.
+    const virtualMagicLands = countMagicHeroVirtualLands(
+      armaSummary.heroes,
+      player.turnsSpentTotal
+    );
+    const mm = magicMultiplier(
+      landCounts.magic + virtualMagicLands,
+      player.activeUpgrades ?? {}
+    );
+    const successChance = computeArmageddonSuccessChanceFromMultiplier(mm);
+    const success = rng() < successChance;
+
+    // Turns + cast counter deduct regardless of success (high-risk gamble).
+    const turnsSpentTotal = player.turnsSpentTotal + ARMAGEDDON_TURN_COST;
+    const armageddonCastsAttempted =
+      (player.armageddonCastsAttempted ?? 0) + 1;
+    let armageddonSealsBroken = player.armageddonSealsBroken ?? 0;
+
+    const seasonNumber = worldMeta.seasonNumber ?? 1;
+    let sealsBrokenAfter = sealsBrokenBefore;
+    let shouldTriggerResolve = false;
+
+    if (success) {
+      const sealIndex = sealsBrokenBefore;
+      // Build the canonical 7-slot seals array, defaulting any missing
+      // entries to unbroken. The Armageddon flow always writes back a full
+      // length-7 array so readers don't need null-checks.
+      const seals: SealRecord[] = Array.from({ length: SEAL_COUNT }, (_, i) => {
+        const existing = worldMeta.seals?.[i];
+        if (existing) return existing;
+        return { index: i, broken: false };
+      });
+      seals[sealIndex] = {
+        index: sealIndex,
+        broken: true,
+        brokenBy: {
+          userId: player.userId,
+          displayName: player.displayName,
+          caste: player.caste,
+        },
+        brokenAt: now,
+      };
+      sealsBrokenAfter = sealsBrokenBefore + 1;
+      armageddonSealsBroken += 1;
+
+      const metaPatch: Partial<GameWorldMeta> = {
+        sealsBroken: sealsBrokenAfter,
+        seals,
+        seasonNumber, // re-stamp for backfill on legacy docs
+        updatedAt: now,
+      };
+      if (sealsBrokenAfter >= SEAL_COUNT) {
+        metaPatch.armageddonState = "resolving";
+        metaPatch.armageddonStartedAt = now;
+        shouldTriggerResolve = true;
+      }
+      tx.set(worldMetaResult.ref, metaPatch, { merge: true });
+
+      logCommunityEventInTx(
+        tx,
+        db,
+        {
+          kind: "seal_broken",
+          actorUserId: player.userId,
+          actorDisplayName: player.displayName,
+          actorCaste: player.caste,
+          sealIndex,
+          seasonNumber,
+        },
+        now
+      );
+
+      // Phase 7: resolve any prophecies targeting this seal — stamp
+      // them fulfilled, increment authors' prophecyFulfilledCount, and
+      // post `prophecy_fulfilled` feed events.
+      if (player.caste) {
+        await resolveProphesiesForSealInTx({
+          tx,
+          db,
+          // Prophecies are filed against 1-indexed seal numbers; the
+          // internal sealIndex is 0-indexed.
+          brokenSealNumber: sealIndex + 1,
+          brokenBy: {
+            userId: player.userId,
+            displayName: player.displayName,
+            caste: player.caste,
+          },
+          now,
+        });
+      }
+      if (shouldTriggerResolve) {
+        logCommunityEventInTx(
+          tx,
+          db,
+          {
+            kind: "armageddon_started",
+            actorUserId: player.userId,
+            actorDisplayName: player.displayName,
+            actorCaste: player.caste,
+            seasonNumber,
+          },
+          now
+        );
+      }
+    }
+    // (Failure-event logging is skipped to keep the community feed signal-
+    // to-noise high; a failed cast is a private experience for the caster.)
+
+    tx.update(playerRef, {
+      turnsRemaining: player.turnsRemaining - ARMAGEDDON_TURN_COST,
+      turnsSpentTotal,
+      armageddonCastsAttempted,
+      armageddonSealsBroken,
+      seasonNumber, // backfill in case the doc predated the field
+      updatedAt: now,
+    });
+
+    const updatedPlayer: GamePlayer = {
+      ...player,
+      turnsRemaining: player.turnsRemaining - ARMAGEDDON_TURN_COST,
+      turnsSpentTotal,
+      armageddonCastsAttempted,
+      armageddonSealsBroken,
+      seasonNumber,
+      updatedAt: now,
+    };
+
+    return {
+      success,
+      successChance,
+      sealsBroken: sealsBrokenAfter,
+      seasonNumber,
+      player: updatedPlayer,
+      shouldTriggerResolve,
+    };
+  });
+}
+
+/** Lists the most-recent N past Armageddons (hall-of-fame). Doc ID is the
+ *  season number, so ordering by ID descending is the canonical order.
+ *  No composite index required. */
+export async function listArmageddonHistoryServer(
+  limit: number = 50
+): Promise<ArmageddonEventRecord[]> {
+  const db = adminDbOrThrow();
+  const snap = await db
+    .collection(COLLECTIONS.ARMAGEDDON_EVENTS)
+    .orderBy("seasonNumber", "desc")
+    .limit(Math.max(1, Math.min(200, limit)))
+    .get();
+  return snap.docs.map((d) => d.data() as ArmageddonEventRecord);
+}
+
+// =====================================================================
+// Zero-turn gameplay: new server actions
+// =====================================================================
+//
+// These functions are the entrypoints for the May 2026 zero-turn
+// gameplay features. Each enforces its own gating (rate limits, caps,
+// cooldowns, 0-turn predicates) so the actions complement rather than
+// replace the turn economy.
+
+/**
+ * Grants PEP_TALK_STAMINA_GAIN stamina to one of the caller's heroes.
+ *
+ * Gating:
+ *   - Caller must currently have turnsRemaining === 0 (consolation
+ *     mechanic; doesn't trivialize stamina for active players).
+ *   - Per-day rate limit is enforced at the API route layer (3/day).
+ *
+ * The target hero is identified by its `tileId` — pep talks always go
+ * to "the hero on this tile." This avoids needing a separate heroId
+ * lookup index when the hero registry has the canonical id but the
+ * tile snapshot is what combat reads.
+ */
+export async function pepTalkHeroServer(args: {
+  callerUserId: string;
+  tileId: string;
+  now?: Date;
+}): Promise<GameTile> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.callerUserId);
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(args.tileId);
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, tileSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(tileRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!tileSnap.exists) throw new GameTileNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const tile = tileSnap.data() as GameTile;
+    if (player.turnsRemaining > 0) {
+      throw new GamePepTalkRequiresZeroTurnsError();
+    }
+    if (tile.ownerId !== args.callerUserId) throw new GameTileNotOwnedError();
+    if (!tile.hero) throw new GameHeroNotFoundError();
+    if (tile.hero.ownerId !== args.callerUserId) {
+      throw new GameHeroNotOwnedError();
+    }
+    const updatedHero: GameHero = {
+      ...tile.hero,
+      stamina: Math.min(
+        tile.hero.staminaMax,
+        tile.hero.stamina + PEP_TALK_STAMINA_GAIN
+      ),
+      lastEngagedAtTurn: player.turnsSpentTotal,
+    };
+    tx.update(tileRef, { hero: updatedHero, updatedAt: now });
+    // Mirror the stamina onto the persistent registry doc so the All
+    // Heroes browse view stays accurate.
+    tx.update(
+      db.collection("game_heroes").doc(updatedHero.id),
+      { stamina: updatedHero.stamina, updatedAt: now }
+    );
+    return { ...tile, hero: updatedHero, updatedAt: now };
+  });
+}
+
+/**
+ * Puts one of the caller's heroes into meditation for
+ * MEDITATION_DURATION_MS. Stamina is set to staminaMax immediately and
+ * the hero is marked off-duty — combat and engagement skip them until
+ * the timer expires.
+ *
+ * Gating:
+ *   - The hero must be owned by the caller and on a tile.
+ *   - The hero must not already be meditating.
+ *   - The caller can have at most MEDITATION_MAX_ACTIVE_SLOTS heroes
+ *     meditating at once (default 1).
+ */
+export async function meditateHeroServer(args: {
+  callerUserId: string;
+  tileId: string;
+  now?: Date;
+}): Promise<GameTile> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.callerUserId);
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(args.tileId);
+  // Count the player's currently-meditating heroes via a non-tx query
+  // (Firestore can't `where` inside a tx). Slight race: a second concurrent
+  // call could double-spend the slot. Acceptable for the cap of 1 — worst
+  // case the player ends up with 2 meditating, the cap reasserts after.
+  const ownedSnap = await db
+    .collection(COLLECTIONS.TILES)
+    .where("ownerId", "==", args.callerUserId)
+    .get();
+  let meditating = 0;
+  for (const doc of ownedSnap.docs) {
+    const t = doc.data() as GameTile;
+    if (t.hero && t.hero.meditatingUntil) {
+      const until =
+        t.hero.meditatingUntil instanceof Date
+          ? t.hero.meditatingUntil
+          : (t.hero.meditatingUntil as { toDate: () => Date }).toDate?.() ??
+            null;
+      if (until && until.getTime() > now.getTime()) meditating += 1;
+    }
+  }
+  if (meditating >= MEDITATION_MAX_ACTIVE_SLOTS) {
+    throw new GameMeditationSlotFullError();
+  }
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, tileSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(tileRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!tileSnap.exists) throw new GameTileNotFoundError();
+    const tile = tileSnap.data() as GameTile;
+    if (tile.ownerId !== args.callerUserId) throw new GameTileNotOwnedError();
+    if (!tile.hero) throw new GameHeroNotFoundError();
+    if (tile.hero.ownerId !== args.callerUserId) {
+      throw new GameHeroNotOwnedError();
+    }
+    if (tile.hero.meditatingUntil) {
+      const until =
+        tile.hero.meditatingUntil instanceof Date
+          ? tile.hero.meditatingUntil
+          : null;
+      if (until && until.getTime() > now.getTime()) {
+        throw new GameHeroAlreadyMeditatingError();
+      }
+    }
+    const meditatingUntil = new Date(now.getTime() + MEDITATION_DURATION_MS);
+    const updatedHero: GameHero = {
+      ...tile.hero,
+      stamina: tile.hero.staminaMax,
+      meditatingUntil,
+      lastEngagedAtTurn: (playerSnap.data() as GamePlayer).turnsSpentTotal,
+    };
+    tx.update(tileRef, { hero: updatedHero, updatedAt: now });
+    tx.update(
+      db.collection("game_heroes").doc(updatedHero.id),
+      {
+        stamina: updatedHero.stamina,
+        meditatingUntil,
+        updatedAt: now,
+      }
+    );
+    return { ...tile, hero: updatedHero, updatedAt: now };
+  });
+}
+
+/**
+ * Moves units between two adjacent tiles the caller owns. Applies the
+ * REDISTRIBUTE_TRANSIT_LOSS haircut to the moved stack. Capped at
+ * REDISTRIBUTE_MAX_PER_DAY per player per rolling 24h window.
+ */
+export async function redistributeUnitsServer(args: {
+  callerUserId: string;
+  sourceTileId: string;
+  destTileId: string;
+  units: UnitStack;
+  now?: Date;
+}): Promise<{ source: GameTile; dest: GameTile }> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.callerUserId);
+  const sourceRef = db.collection(COLLECTIONS.TILES).doc(args.sourceTileId);
+  const destRef = db.collection(COLLECTIONS.TILES).doc(args.destTileId);
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, sourceSnap, destSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(sourceRef),
+      tx.get(destRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!sourceSnap.exists) throw new GameTileNotFoundError();
+    if (!destSnap.exists) throw new GameTileNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const source = sourceSnap.data() as GameTile;
+    const dest = destSnap.data() as GameTile;
+    if (source.ownerId !== args.callerUserId) {
+      throw new GameTileNotOwnedError();
+    }
+    if (dest.ownerId !== args.callerUserId) {
+      throw new GameTileNotOwnedError();
+    }
+    if (!source.neighborTileIds.includes(args.destTileId)) {
+      throw new GameNotAdjacentError();
+    }
+    if (!stackHasAtLeast(source.units, args.units)) {
+      throw new GameInsufficientUnitsError();
+    }
+    // Pruned rolling-24h counter from the player's recentRedistributions.
+    const recent = (player.recentRedistributions ?? []).filter((entry) => {
+      const ms =
+        entry instanceof Date
+          ? entry.getTime()
+          : ((entry as { toMillis?: () => number }).toMillis?.() ?? 0);
+      return now.getTime() - ms < 24 * 60 * 60 * 1000;
+    });
+    if (recent.length >= REDISTRIBUTE_MAX_PER_DAY) {
+      // Find the oldest entry to compute retryAfter.
+      const oldest = recent[0];
+      const oldestMs =
+        oldest instanceof Date
+          ? oldest.getTime()
+          : ((oldest as { toMillis?: () => number }).toMillis?.() ?? 0);
+      const retryAfter = 24 * 60 * 60 * 1000 - (now.getTime() - oldestMs);
+      throw new GameRedistributeRateLimitError(Math.max(0, retryAfter));
+    }
+    // Apply the transit-loss haircut.
+    const arrived = {
+      ground: Math.floor(
+        args.units.ground * (1 - 0.08) // REDISTRIBUTE_TRANSIT_LOSS
+      ),
+      siege: Math.floor(args.units.siege * (1 - 0.08)),
+      air: Math.floor(args.units.air * (1 - 0.08)),
+    };
+    const newSourceUnits: UnitStack = {
+      ground: source.units.ground - args.units.ground,
+      siege: source.units.siege - args.units.siege,
+      air: source.units.air - args.units.air,
+    };
+    const newDestUnits: UnitStack = {
+      ground: dest.units.ground + arrived.ground,
+      siege: dest.units.siege + arrived.siege,
+      air: dest.units.air + arrived.air,
+    };
+    // Cap check on destination: SUPER stack can't exceed tile capacity.
+    const destCapacity = computeTileCapacity(
+      dest.type,
+      player.caste,
+      dest.upgradeIds,
+      player.activeUpgrades ?? {}
+    );
+    if (sumStack(newDestUnits) > destCapacity) {
+      throw new GameTileFullError(
+        Math.max(0, destCapacity - sumStack(dest.units)),
+        sumStack(arrived)
+      );
+    }
+    const nextRecent = [...recent, now];
+    tx.update(sourceRef, { units: newSourceUnits, updatedAt: now });
+    tx.update(destRef, { units: newDestUnits, updatedAt: now });
+    tx.update(playerRef, {
+      recentRedistributions: nextRecent,
+      updatedAt: now,
+    });
+    return {
+      source: { ...source, units: newSourceUnits, updatedAt: now },
+      dest: { ...dest, units: newDestUnits, updatedAt: now },
+    };
+  });
+}
+
+/**
+ * Toggles defensive stance on/off on an owned tile.
+ *
+ * Toggling ON:
+ *   - Tile must be owned by caller.
+ *   - Tile must not already be in stance.
+ *   - Caller's activeDefensiveStanceCount must be below the cap
+ *     (max(1, floor(tilesHeld / 100))).
+ *
+ * Toggling OFF:
+ *   - Only allowed if `defensiveStance.lockedUntil <= now` (the 6h
+ *     cooldown has elapsed). Prevents pre-attack flicker.
+ */
+export async function toggleDefensiveStanceServer(args: {
+  callerUserId: string;
+  tileId: string;
+  desiredActive: boolean;
+  now?: Date;
+}): Promise<GameTile> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.callerUserId);
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(args.tileId);
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, tileSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(tileRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!tileSnap.exists) throw new GameTileNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const tile = tileSnap.data() as GameTile;
+    if (tile.ownerId !== args.callerUserId) throw new GameTileNotOwnedError();
+
+    const currentlyActive = isTileInDefensiveStance(tile, now);
+    if (args.desiredActive && currentlyActive) {
+      // No-op: already on.
+      return tile;
+    }
+    if (!args.desiredActive && !currentlyActive) {
+      // No-op: already off.
+      return tile;
+    }
+    if (args.desiredActive) {
+      // Check the cap based on the denormalized counter.
+      const cap = Math.max(1, Math.floor((player.stats?.tilesHeld ?? 0) / 100));
+      const active = player.activeDefensiveStanceCount ?? 0;
+      if (active >= cap) {
+        throw new GameDefensiveStanceCapError(cap);
+      }
+      const stance = {
+        active: true,
+        since: now,
+        lockedUntil: new Date(now.getTime() + DEFENSIVE_STANCE_LOCK_MS),
+      };
+      tx.update(tileRef, { defensiveStance: stance, updatedAt: now });
+      tx.update(playerRef, {
+        activeDefensiveStanceCount: active + 1,
+        updatedAt: now,
+      });
+      return { ...tile, defensiveStance: stance, updatedAt: now };
+    }
+    // Toggle OFF: must wait for lockedUntil.
+    if (tile.defensiveStance) {
+      const lockedMs =
+        tile.defensiveStance.lockedUntil instanceof Date
+          ? tile.defensiveStance.lockedUntil.getTime()
+          : 0;
+      if (lockedMs > now.getTime()) {
+        throw new GameDefensiveStanceLockedError();
+      }
+    }
+    tx.update(tileRef, { defensiveStance: null, updatedAt: now });
+    tx.update(playerRef, {
+      activeDefensiveStanceCount: Math.max(
+        0,
+        (player.activeDefensiveStanceCount ?? 0) - 1
+      ),
+      updatedAt: now,
+    });
+    return { ...tile, defensiveStance: null as never, updatedAt: now };
+  });
+}
+
+/**
+ * Declares Last Stand on an owned tile. Requires:
+ *   - turnsRemaining === 0
+ *   - Inbound attack threat within LAST_STAND_THREAT_WINDOW_MS (the tile
+ *     has been attacked recently OR a neighbor enemy tile has had a
+ *     burst of activity — we use lastAttackedAt as a simple signal)
+ *   - LAST_STAND_COOLDOWN_MS has elapsed since the last declare
+ *
+ * On success, stamps `activeLastStand` on the tile (consumed by the next
+ * inbound attack — see attackTileServer) and `lastStandUsedAt` on the
+ * player (cooldown clock).
+ */
+/**
+ * Executes the queued orders for one player in sequenceIndex order.
+ * Called from `runWeeklyRolloverServer` after the weekly grant lands.
+ *
+ * Each order is dispatched to the underlying server action
+ * (buildUnitsServer, attackTileServer, etc). Failures are logged as
+ * `failed` on the order doc with a one-line reason so the UI can show
+ * "what happened" without re-running. Successful orders are marked
+ * `executed` and carry the resulting report/attack id for cross-linking.
+ *
+ * No txn wraps the loop itself — each order runs its own server-action
+ * txn. If one fails, subsequent orders still attempt. This matches the
+ * "skip and continue" semantics the plan specified.
+ */
+async function executeQueuedOrdersForPlayer(
+  db: Firestore,
+  playerId: string,
+  now: Date
+): Promise<void> {
+  const orders = await readQueuedOrdersForPlayer(db, playerId);
+  for (const order of orders) {
+    try {
+      await executeQueuedOrder(db, order, now);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // Best-effort: mark failed in its own tx so subsequent orders can
+      // still run even if the txn write fails.
+      try {
+        await db.runTransaction(async (tx) => {
+          markOrderResultInTx({
+            tx,
+            db,
+            order,
+            status: "failed",
+            resultSummary: message.slice(0, 200),
+            now,
+          });
+        });
+      } catch {
+        // swallow — logger already captures
+      }
+    }
+  }
+}
+
+async function executeQueuedOrder(
+  db: Firestore,
+  order: QueuedOrder,
+  now: Date
+): Promise<void> {
+  switch (order.params.kind) {
+    case "recruit_on_tile": {
+      const result = await buildUnitsServer(
+        order.playerId,
+        order.params.tileId,
+        order.params.unitType,
+        now
+      );
+      await db.runTransaction(async (tx) => {
+        markOrderResultInTx({
+          tx,
+          db,
+          order,
+          status: "executed",
+          resultSummary: `Recruited ${result.produced} ${order.params.kind === "recruit_on_tile" ? order.params.unitType : ""} on ${order.params.kind === "recruit_on_tile" ? order.params.tileId : ""}`,
+          now,
+        });
+      });
+      return;
+    }
+    case "attack_adjacent": {
+      const p = order.params;
+      const result = await attackTileServer({
+        attackerId: order.playerId,
+        sourceTileId: p.sourceTileId,
+        targetTileId: p.targetTileId,
+        units: p.units,
+        offenseSpellId: p.offenseSpellId,
+        now,
+      });
+      await db.runTransaction(async (tx) => {
+        markOrderResultInTx({
+          tx,
+          db,
+          order,
+          status: "executed",
+          resultSummary: `Attack ${result.combat.outcome}: ${p.sourceTileId} → ${p.targetTileId}`,
+          resultRefId: result.attack.id,
+          now,
+        });
+      });
+      return;
+    }
+    case "cast_spell_on_tile":
+      // v1: spell casting via queue not supported (the existing server
+      // actions split by spell type — would require deeper integration).
+      await db.runTransaction(async (tx) => {
+        markOrderResultInTx({
+          tx,
+          db,
+          order,
+          status: "failed",
+          resultSummary: "Spell-cast queueing not yet supported",
+          now,
+        });
+      });
+      return;
+  }
+}
+
+export async function declareLastStandServer(args: {
+  callerUserId: string;
+  tileId: string;
+  now?: Date;
+}): Promise<GameTile> {
+  const now = args.now ?? new Date();
+  const db = adminDbOrThrow();
+  const playerRef = db.collection(COLLECTIONS.PLAYERS).doc(args.callerUserId);
+  const tileRef = db.collection(COLLECTIONS.TILES).doc(args.tileId);
+  return db.runTransaction(async (tx) => {
+    const [playerSnap, tileSnap] = await Promise.all([
+      tx.get(playerRef),
+      tx.get(tileRef),
+    ]);
+    if (!playerSnap.exists) throw new GamePlayerNotFoundError();
+    if (!tileSnap.exists) throw new GameTileNotFoundError();
+    const player = playerSnap.data() as GamePlayer;
+    const tile = tileSnap.data() as GameTile;
+    if (tile.ownerId !== args.callerUserId) throw new GameTileNotOwnedError();
+    if (player.turnsRemaining > 0) {
+      throw new GameLastStandRequiresZeroTurnsError();
+    }
+    // Cooldown check.
+    if (player.lastStandUsedAt) {
+      const used =
+        player.lastStandUsedAt instanceof Date
+          ? player.lastStandUsedAt.getTime()
+          : 0;
+      const elapsed = now.getTime() - used;
+      if (elapsed < LAST_STAND_COOLDOWN_MS) {
+        throw new GameLastStandCooldownError(
+          LAST_STAND_COOLDOWN_MS - elapsed
+        );
+      }
+    }
+    // Threat check: tile has been attacked within the threat window.
+    const lastAttackedMs =
+      tile.lastAttackedAt instanceof Date
+        ? tile.lastAttackedAt.getTime()
+        : 0;
+    if (now.getTime() - lastAttackedMs > LAST_STAND_THREAT_WINDOW_MS) {
+      throw new GameLastStandNoThreatError();
+    }
+    const activeLastStand = {
+      declaredAt: now,
+      expiresAt: new Date(now.getTime() + LAST_STAND_WINDOW_MS),
+    };
+    tx.update(tileRef, { activeLastStand, updatedAt: now });
+    tx.update(playerRef, { lastStandUsedAt: now, updatedAt: now });
+    return { ...tile, activeLastStand, updatedAt: now };
   });
 }

@@ -1,4 +1,6 @@
+/* eslint-disable jsx-a11y/label-has-associated-control -- legacy form markup; tracked separately */
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -22,6 +24,7 @@ import { getTopMatches } from "@/lib/pair-programming/matching";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { NeedsWorkBanner } from "@/components/NeedsWorkBanner";
+import { SectionHelp } from "@/components/SectionHelp";
 
 interface PublicUser {
   uid: string;
@@ -34,7 +37,7 @@ export default function PairProgrammingPage() {
   const [profile, setProfile] = useState<PairProfile | null>(null);
   const [matches, setMatches] = useState<MatchScore[]>([]);
   const [requests, setRequests] = useState<PairRequest[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [showProfileForm, setShowProfileForm] = useState(false);
   const [userProfiles, setUserProfiles] = useState<Record<string, PublicUser>>({});
   const [refreshKey, setRefreshKey] = useState(0);
@@ -42,10 +45,8 @@ export default function PairProgrammingPage() {
   // Fetch user's pair profile
   useEffect(() => {
     async function fetchProfile() {
-      if (!user || !db) {
-        setLoading(false);
-        return;
-      }
+      if (!user || !db) return;
+      setLoading(true);
 
       try {
         const userProfile = await getPairProfile(user.uid);
@@ -229,6 +230,36 @@ export default function PairProgrammingPage() {
             Edit Profile
           </button>
         </div>
+
+        <SectionHelp
+          title="How matching works"
+          intro={
+            <>
+              Tell the matchmaker your skills, what you want to learn, and
+              your timezone / availability. You&apos;ll see other developers
+              whose profiles complement yours. Send a request; if they
+              accept, you get a session you can plan together.
+            </>
+          }
+          faq={[
+            {
+              q: "How long should I expect to wait for a response?",
+              a: "Most accepts/declines happen within 1–2 days. If you haven't heard back in a week, the request will time out and you can re-aim it at someone else.",
+            },
+            {
+              q: "What makes a good request?",
+              a: "Be specific. \"Want to pair on a Next.js auth flow this Saturday afternoon EST\" gets way more accepts than \"hey want to code sometime\". Mention what you'll bring (a codebase to work in, a problem to solve, a learning goal).",
+            },
+            {
+              q: "Can I be both mentor-ish and learner-ish?",
+              a: "Yes. The same person can have skills they're teaching AND skills they're learning. The matcher uses both axes — you'll show up in searches both ways.",
+            },
+          ]}
+          links={[
+            { label: "View your requests", href: "/pair/requests" },
+            { label: "Mentorship (longer commitment)", href: "/mentorship" },
+          ]}
+        />
 
         {/* Pending Requests */}
         {requests.length > 0 && (

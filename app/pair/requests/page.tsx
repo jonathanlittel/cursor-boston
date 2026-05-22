@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -26,17 +27,15 @@ export default function PairRequestsPage() {
   const [sentRequests, setSentRequests] = useState<PairRequest[]>([]);
   const [receivedRequests, setReceivedRequests] = useState<PairRequest[]>([]);
   const [userProfiles, setUserProfiles] = useState<Record<string, PublicUser>>({});
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<"sent" | "received">("received");
   const [refreshKey, setRefreshKey] = useState(0);
   const router = useRouter();
 
   useEffect(() => {
     async function fetchRequests() {
-      if (!user || !db) {
-        setLoading(false);
-        return;
-      }
+      if (!user || !db) return;
+      setLoading(true);
 
       try {
         const token = await user.getIdToken();

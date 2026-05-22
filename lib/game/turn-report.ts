@@ -1,4 +1,5 @@
 /**
+ * SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Cursor Boston
  * This file is part of Cursor Boston, licensed under GPL-3.0.
  * See LICENSE file for details.
@@ -8,6 +9,7 @@ import type {
   ArtifactDefinition,
   AttackOutcome,
   CombatResult,
+  GameHero,
   GameTile,
   LandType,
   TurnReport,
@@ -50,6 +52,55 @@ function attachArtifact(
   };
 }
 
+/** Appends hero-related side effects (emergence + farm-hero special-unit
+ *  summon) to a report. Adds narrative lines and stamps a `heroEmerged`
+ *  field on `outcome` so the dashboard's DashboardReports can render a
+ *  "✨ {name} the {specialty} {class} hero emerged!" line. */
+export interface HeroReportExtras {
+  heroEmerged?: GameHero | null;
+  specialUnitSummoned?: {
+    instanceId: string;
+    defId: string;
+    name: string;
+  } | null;
+}
+
+function attachHero(report: TurnReport, extras: HeroReportExtras): TurnReport {
+  if (!extras.heroEmerged && !extras.specialUnitSummoned) return report;
+  const narrative = [...report.narrative];
+  let outcome = { ...report.outcome };
+  if (extras.heroEmerged) {
+    const h = extras.heroEmerged;
+    narrative.push(
+      `✨ ${h.name} (${h.specialty} ${h.class} hero) has emerged on ${h.tileId}.`
+    );
+    outcome = {
+      ...outcome,
+      heroEmerged: {
+        id: h.id,
+        name: h.name,
+        class: h.class,
+        specialty: h.specialty,
+        tileId: h.tileId,
+      },
+    };
+  }
+  if (extras.specialUnitSummoned) {
+    narrative.push(
+      `A ${extras.specialUnitSummoned.name} has answered the call.`
+    );
+    outcome = {
+      ...outcome,
+      specialUnitSummoned: {
+        instanceId: extras.specialUnitSummoned.instanceId,
+        defId: extras.specialUnitSummoned.defId,
+        name: extras.specialUnitSummoned.name,
+      },
+    };
+  }
+  return { ...report, narrative, outcome };
+}
+
 // ───────── explore ─────────
 
 export function buildExploreReport(
@@ -80,6 +131,10 @@ export function buildBuildReport(args: {
   unitsBuilt: number;
   artifactFound: ArtifactDefinition | null;
   rng: () => number;
+  // Heroes (May 2026). Optional — when present, attaches a narrative line
+  // and stamps the outcome with `heroEmerged` / `specialUnitSummoned`.
+  heroEmerged?: GameHero | null;
+  specialUnitSummoned?: HeroReportExtras["specialUnitSummoned"];
 }): TurnReport {
   const narrative = [pickLine(BUILD_NARRATIVES, args.rng)];
   const base: TurnReport = {
@@ -94,7 +149,11 @@ export function buildBuildReport(args: {
       unitsBuilt: args.unitsBuilt,
     },
   };
-  return attachArtifact(base, args.artifactFound);
+  const withArtifact = attachArtifact(base, args.artifactFound);
+  return attachHero(withArtifact, {
+    heroEmerged: args.heroEmerged ?? null,
+    specialUnitSummoned: args.specialUnitSummoned ?? null,
+  });
 }
 
 // ───────── distribute ─────────
@@ -128,6 +187,7 @@ export function buildArmDefenseReport(args: {
   spellName: string;
   artifactFound: ArtifactDefinition | null;
   rng: () => number;
+  heroEmerged?: GameHero | null;
 }): TurnReport {
   const narrative = [pickLine(SPELL_ARM_NARRATIVES, args.rng)];
   const base: TurnReport = {
@@ -142,7 +202,8 @@ export function buildArmDefenseReport(args: {
       spellName: args.spellName,
     },
   };
-  return attachArtifact(base, args.artifactFound);
+  const withArtifact = attachArtifact(base, args.artifactFound);
+  return attachHero(withArtifact, { heroEmerged: args.heroEmerged ?? null });
 }
 
 // ───────── cast production spell ─────────
@@ -201,6 +262,27 @@ export function buildAttackReport(args: {
   combat: CombatResult;
   artifactFound: ArtifactDefinition | null;
   rng: () => number;
+  // Heroes (May 2026). Optional — present when the attack triggered a
+  // hero side-effect.
+  heroEmerged?: GameHero | null;
+  // The chosen action against the defender's hero (when one was present
+  // and the attacker won). Null/undefined when no hero was on the tile or
+  // combat didn't capture. After convert-failure this reflects the
+  // FALLBACK action (kill / spare), so the narrative shows what actually
+  // happened.
+  heroAction?: "kill" | "spare" | "convert" | null;
+  heroDefected?: {
+    id: string;
+    name: string;
+    class: GameHero["class"];
+    specialty: GameHero["specialty"];
+  } | null;
+  heroSlain?: {
+    id: string;
+    name: string;
+    class: GameHero["class"];
+    specialty: GameHero["specialty"];
+  } | null;
 }): TurnReport {
   const opening = pickLine(ATTACK_OPENINGS, args.rng);
   const middle = pickLine(ATTACK_MIDDLES, args.rng);
@@ -210,9 +292,27 @@ export function buildAttackReport(args: {
   const line2 = `Sent ${fmtStack(args.unitsSent)} (${totalUnits(args.unitsSent)} total). Lost ${fmtStack(
     args.combat.attackerLosses
   )}; defenders lost ${fmtStack(args.combat.defenderLosses)}.`;
+  const heroLines: string[] = [];
+  if (args.heroDefected) {
+    heroLines.push(
+      `${args.heroDefected.name} (${args.heroDefected.specialty} ${args.heroDefected.class} hero) has defected to your kingdom.`
+    );
+  } else if (args.heroSlain) {
+    heroLines.push(
+      `${args.heroSlain.name} (${args.heroSlain.specialty} ${args.heroSlain.class} hero) fell with the tile.`
+    );
+  } else if (args.heroAction === "spare") {
+    heroLines.push(
+      "The hero on the tile was spared. The line did not break."
+    );
+  }
 
   let summary: string;
-  if (args.combat.outcome === "captured") {
+  if (args.heroAction === "spare") {
+    summary = `Wore down hero at ${args.targetTileId}`;
+  } else if (args.heroDefected) {
+    summary = `Hero defected at ${args.targetTileId}`;
+  } else if (args.combat.outcome === "captured") {
     summary = `Captured ${args.targetTileId}`;
   } else if (args.combat.outcome === "repelled") {
     summary = `Repelled at ${args.targetTileId}`;
@@ -225,7 +325,7 @@ export function buildAttackReport(args: {
     action: "attack",
     cost: args.cost,
     summary,
-    narrative: [line1, line2],
+    narrative: [line1, line2, ...heroLines],
     outcome: {
       targetTileId: args.targetTileId,
       result: args.combat.outcome,
@@ -248,9 +348,14 @@ export function buildAttackReport(args: {
       siegeDebuffApplied: args.combat.siegeDebuffApplied,
       defenseDisarmApplied: args.combat.defenseDisarmApplied,
       preCastOffenseApplied: args.combat.preCastOffenseApplied,
+      // Hero side-effects (when applicable).
+      ...(args.heroAction ? { heroAction: args.heroAction } : {}),
+      ...(args.heroDefected ? { heroDefected: args.heroDefected } : {}),
+      ...(args.heroSlain ? { heroSlain: args.heroSlain } : {}),
     },
   };
-  return attachArtifact(base, args.artifactFound);
+  const withArtifact = attachArtifact(base, args.artifactFound);
+  return attachHero(withArtifact, { heroEmerged: args.heroEmerged ?? null });
 }
 
 // ───────── siege ─────────
@@ -325,6 +430,7 @@ export function buildCastSpellReport(args: {
   disarm?: { fractionApplied: number };
   attrition?: { unitsKilled: UnitStack };
   rng: () => number;
+  heroEmerged?: GameHero | null;
 }): TurnReport {
   let summary: string;
   let narrativeBank: string[];
@@ -342,7 +448,7 @@ export function buildCastSpellReport(args: {
     summary = `${args.spellName} on ${args.targetTileId} · ${total} defenders lost`;
     narrativeBank = CAST_ATTRITION_NARRATIVES;
   }
-  return {
+  const base: TurnReport = {
     turnIndex: args.turnIndex,
     action: "spell-cast",
     cost: args.cost,
@@ -358,6 +464,7 @@ export function buildCastSpellReport(args: {
       ...(args.attrition ? { attrition: args.attrition } : {}),
     },
   };
+  return attachHero(base, { heroEmerged: args.heroEmerged ?? null });
 }
 
 // ───────── flyover ─────────
